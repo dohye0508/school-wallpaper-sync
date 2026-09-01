@@ -137,7 +137,7 @@ DEFAULT_SECTIONS = {
     },
     "meals": {
         "x": 50,
-        "y": 50,
+        "y": 55,
         "show": True,
         "stroke_width": 0,
         "shadow_blur": 5,
@@ -200,7 +200,7 @@ def hex_to_rgba(hex_str, alpha=255):
         return (r, g, b, a)
     return (255, 255, 255, alpha)
 
-def save_data_cache(timetable, meals, ymd=None):
+def save_data_cache(timetable, meals, ymd=None, cfg=None):
     os.makedirs(os.path.dirname(DATA_CACHE_PATH), exist_ok=True)
     if ymd is None:
         ymd = datetime.now().strftime("%Y%m%d")
@@ -208,7 +208,12 @@ def save_data_cache(timetable, meals, ymd=None):
         "date": ymd,
         "timetable": timetable,
         "meals": meals,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        # 어느 학교/학년/반의 데이터인지 함께 기록해서, 학교를 바꿨는데도
+        # "오늘 날짜"라는 이유만으로 이전 학교의 캐시를 재사용하는 것을 방지한다
+        "school_code": (cfg or {}).get("school_code"),
+        "grade": (cfg or {}).get("grade"),
+        "classnm": (cfg or {}).get("classnm"),
     }
     with open(DATA_CACHE_PATH, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
@@ -219,22 +224,31 @@ def load_data_cache(cfg=None):
         try:
             with open(DATA_CACHE_PATH, "r", encoding="utf-8") as f:
                 cache = json.load(f)
-            # 오늘 날짜의 캐시 데이터가 유효하면 즉시 반환
-            if cache.get("date") == today and (cache.get("timetable") or cache.get("meals")):
+            same_school = True
+            if cfg and cfg.get("school_code"):
+                same_school = (
+                    cache.get("school_code") == cfg.get("school_code")
+                    and cache.get("grade") == cfg.get("grade")
+                    and cache.get("classnm") == cfg.get("classnm")
+                )
+            # 오늘 날짜 + 같은 학교/학년/반의 캐시 데이터일 때만 재사용한다
+            if cache.get("date") == today and same_school and (cache.get("timetable") or cache.get("meals")):
                 return cache
         except Exception:
             pass
-            
-    # 오늘 날짜가 아니거나 캐시가 없는데 cfg가 주어졌다면 실시간으로 오늘 데이터 조회 후 캐싱
+
+    # 오늘 날짜가 아니거나, 학교가 바뀌었거나, 캐시가 없는데 cfg가 주어졌다면
+    # 실시간으로 오늘 데이터 조회 후 캐싱
     if cfg and cfg.get("school_code"):
         try:
             timetable = fetch_timetable(cfg, today)
             meals = fetch_meal(cfg, today)
-            save_data_cache(timetable, meals, today)
-            return {"date": today, "timetable": timetable, "meals": meals}
+            save_data_cache(timetable, meals, today, cfg)
+            return {"date": today, "timetable": timetable, "meals": meals,
+                    "school_code": cfg.get("school_code"), "grade": cfg.get("grade"), "classnm": cfg.get("classnm")}
         except Exception as e:
             print(f"[오늘 데이터 자동 조회 실패] {e}")
-            
+
     return {"date": today, "timetable": [], "meals": []}
 
 
@@ -774,7 +788,7 @@ def update_once(cfg):
     ymd = now.strftime("%Y%m%d")
     meals = fetch_meal(cfg, ymd)
     timetable = fetch_timetable(cfg, ymd)
-    save_data_cache(timetable, meals, ymd) # 로컬 캐시 갱신
+    save_data_cache(timetable, meals, ymd, cfg) # 로컬 캐시 갱신
     path = render_wallpaper(cfg, now, timetable, meals)
     set_wallpaper(path)
     ensure_autostart() # 윈도우 시작 시 자동 실행 등록

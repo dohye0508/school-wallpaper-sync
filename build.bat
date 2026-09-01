@@ -12,7 +12,7 @@ rmdir /s /q build
 rmdir /s /q build_gui
 rmdir /s /q dist
 del /q *.spec
-del /q "학교바탕화면설정.exe"
+del /q "?숆탳諛뷀깢?붾㈃?ㅼ젙.exe"
 rmdir /s /q __pycache__ 2>nul
 
 echo Build complete!

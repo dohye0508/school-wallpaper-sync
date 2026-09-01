@@ -56,6 +56,11 @@ def search_school(name):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        # 위젯을 다 만들기 전에는 창을 화면에 보여주지 않는다. (슬라이더/색상 버튼
+        # 등 내용물이 다 붙기 전에 geometry()를 호출하면, Tk가 내용물 크기에 맞춰
+        # 창을 먼저 크게 띄웠다가 첫 클릭(리드로우) 시점에야 지정한 크기로 줄어드는
+        # 현상이 있었다 — 완성된 뒤에 크기를 다시 맞추고 그때 보여주면 이 깜빡임이 없다)
+        self.withdraw()
         self.title("학교 바탕화면 설정")
         self.resizable(False, False)
         # 창 크기 조정 (Y축 길이를 늘려 저장/초기화/닫기 버튼이 시원하게 보이도록 여백 확보)
@@ -79,6 +84,9 @@ class App(tk.Tk):
         self.search_results = []
         self.selected_school = None
         self.pending_apply = None
+        # 위젯을 만드는 동안 슬라이더 초기값 세팅이 command 콜백을 트리거해서
+        # 창을 열자마자 원치 않는 실시간 적용이 발생하는 것을 막는 플래그
+        self._initializing = True
 
         # GUI 실행 시 오늘 날짜의 시간표/급식 데이터가 없으면 백그라운드로 자동 갱신
         if self.cfg.get("school_code"):
@@ -108,6 +116,11 @@ class App(tk.Tk):
 
         self.result_list = tk.Listbox(tab_basic, height=4, width=54, font=("맑은 고딕", 11))
         self.result_list.pack(anchor="w", padx=15, pady=4)
+        self.result_list.bind("<<ListboxSelect>>", self.on_result_select)
+
+        self.selected_school_var = tk.StringVar(value=self._selected_school_label())
+        ttk.Label(tab_basic, textvariable=self.selected_school_var, foreground="#1a5fb4",
+                  font=("맑은 고딕", 10, "bold")).pack(anchor="w", padx=15, pady=(0, 4))
 
         gc_row = ttk.Frame(tab_basic)
         gc_row.pack(anchor="w", padx=15, pady=4, fill="x")
@@ -321,6 +334,26 @@ class App(tk.Tk):
 
         # 실시간 바탕화면 연동 (Live Apply) 바인딩 시작
         self.bind_variables_for_live_apply()
+        # 위젯 구성이 끝났으니 이제부터는 사용자의 실제 조작만 실시간 적용으로 취급한다
+        self._initializing = False
+
+        # 모든 위젯이 다 붙은 뒤 실제 크기를 계산시키고, 원하는 크기로 다시
+        # 고정한 다음 화면 가운데에 배치하고서야 창을 보여준다 (깜빡임 방지).
+        # update_idletasks()만으로는 Notebook처럼 크기 협상이 한 틱 늦게 끝나는
+        # 위젯이 있어 완전히 반영되지 않는 경우가 있어 update()로 강제로 다 처리한다.
+        self.update()
+        w, h = 590, 660
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x, y = (sw - w) // 2, (sh - h) // 2
+        # 내용물이 늘어나도 창 자체는 이 크기를 넘지 못하도록 위/아래 크기를 고정한다
+        self.minsize(w, h)
+        self.maxsize(w, h)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.state("normal")
+        self.update()
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
     def make_slider_callback(self, sec_name, key, var):
         def callback(val):
@@ -329,9 +362,10 @@ class App(tk.Tk):
             self.label_vars[sec_name][key].set(str(val_int))
             
             # 테두리/그림자 효과 일괄 적용 옵션이 켜져 있을 때 동기화
+            # (창 초기화 중에는 아직 생성되지 않은 섹션이 있을 수 있으므로 존재 여부를 확인한다)
             if self.sync_effects.get() and key in ["stroke_width", "shadow_blur", "shadow_opacity"]:
                 for other_sec in ["school_info", "timetable", "meals", "date_info"]:
-                    if other_sec != sec_name:
+                    if other_sec != sec_name and key in self.sec_vars.get(other_sec, {}):
                         self.sec_vars[other_sec][key].set(val_int)
                         self.label_vars[other_sec][key].set(str(val_int))
             self.trigger_live_apply()
@@ -352,6 +386,8 @@ class App(tk.Tk):
             self.sec_vars[s]["show"].trace_add("write", self.trigger_live_apply)
 
     def trigger_live_apply(self, *args):
+        if getattr(self, "_initializing", False):
+            return  # 창을 여는 중 위젯 초기값 세팅으로 인한 트리거는 무시
         if self.pending_apply:
             self.after_cancel(self.pending_apply)
         # 80ms 디바운스 적용으로 드래그 시 렉 줄임
@@ -397,16 +433,33 @@ class App(tk.Tk):
             print(f"[실시간 적용 실패] {e}")
 
     def _initial_auto_sync(self):
-        """프로그램 시작 시 오늘 날짜의 시간표와 급식이 캐시되어 있지 않으면 실시간 동기화 수행"""
+        """프로그램 시작 시 오늘 날짜의 시간표와 급식이 캐시되어 있지 않으면 실시간 동기화 수행.
+
+        네트워크 호출(NEIS 조회 + 사진 다운로드)에 수 초가 걸리기 때문에, 그 사이 사용자가
+        GUI에서 학교/배경/설정을 바꿔 "저장 및 지금 적용"을 눌러버리면 이 함수가 뒤늦게
+        끝나면서 오래된(stale) self.cfg 스냅샷(예: 예전 학교 코드)으로 시간표/급식을 다시
+        받아와 방금 적용한 결과를 덮어써버리는 경쟁 상태가 있었다. 그래서 데이터를 가져오는
+        시점과 렌더링하는 시점 모두 디스크에서 최신 config를 다시 읽어서 사용한다.
+        """
         try:
+            # self.cfg가 아니라 항상 디스크의 최신 설정(다른 학교로 바뀌었을 수 있음)을 사용한다
+            cfg = main.load_config() or self.cfg
             today = main.datetime.now().strftime("%Y%m%d")
             cache = main.load_data_cache()
-            if cache.get("date") != today or not cache.get("timetable"):
-                timetable = main.fetch_timetable(self.cfg, today)
-                meals = main.fetch_meal(self.cfg, today)
-                main.save_data_cache(timetable, meals, today)
+            same_school = (
+                cache.get("school_code") == cfg.get("school_code")
+                and cache.get("grade") == cfg.get("grade")
+                and cache.get("classnm") == cfg.get("classnm")
+            )
+            if cache.get("date") != today or not cache.get("timetable") or not same_school:
+                timetable = main.fetch_timetable(cfg, today)
+                meals = main.fetch_meal(cfg, today)
+                main.save_data_cache(timetable, meals, today, cfg)
+
+                # 렌더링 직전에 다시 한번 최신 설정을 읽어, 그 사이 사용자가 저장한 변경사항을 존중한다
+                latest_cfg = main.load_config() or cfg
                 now = main.datetime.now()
-                path = main.render_wallpaper(self.cfg, now, timetable, meals)
+                path = main.render_wallpaper(latest_cfg, now, timetable, meals)
                 main.set_wallpaper(path)
                 main.ensure_autostart()
                 self.after(0, lambda: self.status_var.set("오늘 날짜 시간표/급식 동기화 완료 ✓"))
@@ -479,6 +532,24 @@ class App(tk.Tk):
             self.photo_entry.config(state="readonly")
             self.photo_browse_btn.config(state="normal")
 
+    def _selected_school_label(self):
+        cur = self.selected_school if hasattr(self, "selected_school") else None
+        if cur:
+            return f"현재 선택된 학교: {cur['SCHUL_NM']} ({cur['SCHUL_KND_SC_NM']})"
+        cfg_name = self.cfg.get("school_name") if hasattr(self, "cfg") else ""
+        if cfg_name:
+            return f"현재 선택된 학교: {cfg_name} (저장된 설정)"
+        return "선택된 학교 없음 — 검색 후 목록에서 클릭해주세요"
+
+    def on_result_select(self, event=None):
+        # 검색 결과를 클릭하는 즉시 선택을 확정한다 (Apply 시점까지 미루면
+        # 포커스가 옮겨가는 등의 이유로 curselection()이 비어 예전 학교로
+        # 조용히 되돌아가는 문제가 있었다)
+        selection = self.result_list.curselection()
+        if selection and self.search_results and selection[0] < len(self.search_results):
+            self.selected_school = self.search_results[selection[0]]
+            self.selected_school_var.set(self._selected_school_label())
+
     def on_search(self):
         name = self.school_name_var.get().strip()
         if not name:
@@ -489,6 +560,11 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("검색 실패", str(e))
             return
+        # 새로 검색하면 이전에 선택했던 학교는 더 이상 유효하지 않으므로 비운다.
+        # (이전 선택을 그대로 들고 있으면, 새 검색 결과를 클릭하지 않고 바로
+        # 저장할 때 옛날 학교로 조용히 저장되는 버그가 있었다)
+        self.selected_school = None
+        self.selected_school_var.set("검색 결과에서 학교를 클릭해주세요")
         self.result_list.delete(0, tk.END)
         if not self.search_results:
             self.result_list.insert(tk.END, "(검색 결과 없음)")
@@ -515,10 +591,17 @@ class App(tk.Tk):
             messagebox.showwarning("입력 필요", "학년, 반을 모두 입력해주세요.")
             return
 
+        # (안전망) Apply 시점에도 한 번 더 현재 리스트 선택을 확인한다
         selection = self.result_list.curselection()
-        if selection and self.search_results:
+        if selection and self.search_results and selection[0] < len(self.search_results):
             self.selected_school = self.search_results[selection[0]]
 
+        typed_name = self.school_name_var.get().strip()
+
+        # self.selected_school은 on_search()에서 검색할 때마다 매번 비워지므로,
+        # 여기서 값이 있다는 것은 "가장 최근 검색 결과에서 실제로 클릭했다"는
+        # 뜻이다. 검색창에 입력한 텍스트(부분 검색어일 수 있음)와 굳이 이름이
+        # 똑같은지 다시 확인할 필요는 없다 — 클릭한 결과를 그대로 신뢰한다.
         if self.selected_school:
             school = self.selected_school
             kind = school["SCHUL_KND_SC_NM"]
@@ -534,6 +617,16 @@ class App(tk.Tk):
                 "classnm": classnm,
             }
         elif all(k in self.cfg for k in ("edu_code", "school_code", "school_name", "school_kind")):
+            # 새로 선택한 학교가 없다면 기존 저장된 학교를 유지한다 — 단, 검색창에
+            # 입력된 이름이 기존 학교와 다르면 사용자가 학교를 바꾸려다 클릭을
+            # 빠뜨린 것일 수 있으므로 조용히 넘어가지 않고 먼저 확인한다
+            if typed_name and typed_name != self.cfg.get("school_name"):
+                messagebox.showwarning(
+                    "학교 선택 필요",
+                    f"'{typed_name}'을(를) 검색만 하고 목록에서 클릭하지 않으셨습니다.\n"
+                    "검색 결과에서 원하는 학교를 클릭한 뒤 다시 시도해주세요.",
+                )
+                return
             new_cfg = dict(self.cfg)
             new_cfg.update({"api_key": api_key, "grade": grade, "classnm": classnm})
         else:
@@ -570,6 +663,8 @@ class App(tk.Tk):
 
         self.cfg = new_cfg
         save_config(new_cfg)
+        self.school_name_var.set(new_cfg.get("school_name", ""))
+        self.selected_school_var.set(self._selected_school_label())
 
         self.apply_btn.config(state="disabled")
         self.status_var.set("적용 중... (사진/시간표/급식을 가져오는 중)")
