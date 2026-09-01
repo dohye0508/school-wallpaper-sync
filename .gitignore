@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+build/
+build_gui/
+dist/
+*.spec
+bg_cache/
+wallpaper.png
+config.json
+학교바탕화면설정.exe
+SchoolWallpaper.exe
+wallpaper_1.png
+wallpaper_2.png
