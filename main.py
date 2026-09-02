@@ -489,9 +489,9 @@ GRADE_EVENT_FLAG = {
 SCHEDULE_EXCLUDE_NAMES = {"토요휴업일", "일요휴업일"}
 
 
-def fetch_school_schedule(cfg, today):
-    """오늘 이후 가장 가까운 학사일정(시험, 방학, 공휴일 등)을 D-day와 함께 반환한다.
-    NEIS SchoolSchedule API 사용. 학교가 등록한 일정이 없으면 None을 반환한다."""
+def fetch_school_schedule(cfg, today, limit=3):
+    """오늘 이후 가까운 학사일정(시험, 방학, 공휴일 등)을 최대 limit개, D-day와 함께
+    가까운 순으로 반환한다. NEIS SchoolSchedule API 사용. 등록된 일정이 없으면 빈 리스트."""
     ymd = today.strftime("%Y%m%d")
     to_ymd = (today + timedelta(days=120)).strftime("%Y%m%d")
     try:
@@ -507,11 +507,11 @@ def fetch_school_schedule(cfg, today):
             },
         )
         if "SchoolSchedule" not in data:
-            return None
+            return []
         rows = data["SchoolSchedule"][1]["row"]
     except Exception as e:
         print(f"[학사일정 조회 실패] {e}")
-        return None
+        return []
 
     grade_flag = GRADE_EVENT_FLAG.get(str(cfg.get("grade")))
     candidates = [
@@ -520,16 +520,18 @@ def fetch_school_schedule(cfg, today):
         and (not grade_flag or r.get(grade_flag) in ("Y", "*"))
     ]
     if not candidates:
-        return None
+        return []
 
     candidates.sort(key=lambda r: r["AA_YMD"])
-    nearest = candidates[0]
-    event_date = datetime.strptime(nearest["AA_YMD"], "%Y%m%d").date()
-    return {
-        "name": nearest["EVENT_NM"],
-        "date": nearest["AA_YMD"],
-        "dday": (event_date - today.date()).days,
-    }
+    events = []
+    for r in candidates[:limit]:
+        event_date = datetime.strptime(r["AA_YMD"], "%Y%m%d").date()
+        events.append({
+            "name": r["EVENT_NM"],
+            "date": r["AA_YMD"],
+            "dday": (event_date - today.date()).days,
+        })
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -682,11 +684,16 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
         text_ops.append(((x_pos, y), text, fnt, fill, stroke_w, stroke_color))
         return w
 
-    def draw_two_tone_with_effects(part1, font1, color1, part2, font2, color2, x, y, section_cfg, gap=10):
+    def draw_two_tone_with_effects(part1, font1, color1, part2, font2, color2, x, y, section_cfg, gap=10, align="center"):
         w1, _ = text_size(sdraw, part1, font1)
         w2, _ = text_size(sdraw, part2, font2)
         total = w1 + gap + w2
-        x_start = x - total / 2
+        if align == "right":
+            x_start = x - total
+        elif align == "left":
+            x_start = x
+        else:
+            x_start = x - total / 2
         # 두 폰트 크기가 다르면 위쪽 기준으로 그릴 때 글자가 어긋나 보이므로
         # ascent(글자 위쪽 여백) 차이만큼 보정해서 베이스라인을 맞춘다
         ascent1 = font1.getmetrics()[0]
@@ -798,15 +805,19 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
                                    date_str, date_calendar_font, colors["date_calendar"],
                                    dx, dy, s_date, gap=int(16 * date_scale))
 
-    # ---- 5. 학사일정 D-Day 섹션 ----
-    if s_dday.get("show", True) and schedule:
-        ddx = int(W * s_dday.get("x", 50) / 100)
-        ddy = int(H * s_dday.get("y", 11) / 100)
-        dday_n = schedule.get("dday", 0)
-        label = "D-DAY" if dday_n == 0 else f"D-{dday_n}"
-        draw_two_tone_with_effects(label, dday_label_font, colors["dday_label"],
-                                   schedule.get("name", ""), dday_name_font, colors["dday_name"],
-                                   ddx, ddy, s_dday, gap=int(14 * dday_scale))
+    # ---- 5. 학사일정 D-Day 섹션 (가까운 순으로 최대 3개, 오른쪽 정렬) ----
+    dday_events = schedule if isinstance(schedule, list) else ([schedule] if schedule else [])
+    if s_dday.get("show", True) and dday_events:
+        ddx = int(W * s_dday.get("x", 90) / 100)
+        ddy = int(H * s_dday.get("y", 90) / 100)
+        dday_line_gap = int(H * 0.032 * dday_scale)
+        for i, ev in enumerate(dday_events[:3]):
+            dday_n = ev.get("dday", 0)
+            label = "D-DAY" if dday_n == 0 else f"D-{dday_n}"
+            draw_two_tone_with_effects(label, dday_label_font, colors["dday_label"],
+                                       ev.get("name", ""), dday_name_font, colors["dday_name"],
+                                       ddx, ddy + i * dday_line_gap, s_dday,
+                                       gap=int(14 * dday_scale), align="right")
 
     # 3단계: 그림자 블러 레이어 생성 및 합성 (활성화된 섹션 중 최대 블러 반경 기준)
     max_shadow_b = 0.0
@@ -879,8 +890,7 @@ def update_once(cfg):
     set_wallpaper(path)
     ensure_autostart() # 윈도우 시작 시 자동 실행 등록
     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 바탕화면 갱신 완료 "
-          f"(시간표 {len(timetable)}건, 급식 {len(meals)}건, "
-          f"학사일정 {'D' + ('-DAY' if schedule['dday'] == 0 else str(schedule['dday'])) if schedule else '없음'})")
+          f"(시간표 {len(timetable)}건, 급식 {len(meals)}건, 학사일정 {len(schedule)}건)")
 
 
 def main():
