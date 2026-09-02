@@ -215,6 +215,8 @@ class App(tk.Tk):
             ("급식 메뉴", "meals_dish", 3, 1),
             ("요일 텍스트", "date_weekday", 4, 0),
             ("날짜 텍스트", "date_calendar", 4, 1),
+            ("D-Day 라벨", "dday_label", 5, 0),
+            ("학사일정 이름", "dday_name", 5, 1),
         ]
         
         for label, key, r, col in color_items:
@@ -242,7 +244,8 @@ class App(tk.Tk):
             ("학교 정보", "school_info"),
             ("시간표", "timetable"),
             ("급식", "meals"),
-            ("날짜 정보", "date_info")
+            ("날짜 정보", "date_info"),
+            ("학사일정 D-Day", "dday")
         ]
 
         for kr_name, sec_key in sections_info:
@@ -364,7 +367,7 @@ class App(tk.Tk):
             # 테두리/그림자 효과 일괄 적용 옵션이 켜져 있을 때 동기화
             # (창 초기화 중에는 아직 생성되지 않은 섹션이 있을 수 있으므로 존재 여부를 확인한다)
             if self.sync_effects.get() and key in ["stroke_width", "shadow_blur", "shadow_opacity"]:
-                for other_sec in ["school_info", "timetable", "meals", "date_info"]:
+                for other_sec in ["school_info", "timetable", "meals", "date_info", "dday"]:
                     if other_sec != sec_name and key in self.sec_vars.get(other_sec, {}):
                         self.sec_vars[other_sec][key].set(val_int)
                         self.label_vars[other_sec][key].set(str(val_int))
@@ -382,7 +385,7 @@ class App(tk.Tk):
             v.trace_add("write", self.trigger_live_apply)
             
         # 3. 각 섹션별 표시 여부 체크박스만 바인딩 (슬라이더는 command 콜백에서 자체 호출)
-        for s in ["school_info", "timetable", "meals", "date_info"]:
+        for s in ["school_info", "timetable", "meals", "date_info", "dday"]:
             self.sec_vars[s]["show"].trace_add("write", self.trigger_live_apply)
 
     def trigger_live_apply(self, *args):
@@ -400,7 +403,7 @@ class App(tk.Tk):
         font_colors = {k: v.get() for k, v in self.colors_vars.items()}
         
         sections_data = {}
-        for s in ["school_info", "timetable", "meals", "date_info"]:
+        for s in ["school_info", "timetable", "meals", "date_info", "dday"]:
             sections_data[s] = {
                 "show": self.sec_vars[s]["show"].get(),
                 "x": self.sec_vars[s]["x"].get(),
@@ -430,7 +433,7 @@ class App(tk.Tk):
         try:
             cache = main.load_data_cache(self.cfg)
             now = main.datetime.now()
-            path = main.render_wallpaper(cfg, now, cache.get("timetable", []), cache.get("meals", []))
+            path = main.render_wallpaper(cfg, now, cache.get("timetable", []), cache.get("meals", []), cache.get("schedule"))
             main.set_wallpaper(path)
             self.after(0, lambda: self.status_var.set("바탕화면 실시간 반영됨 ✓"))
         except Exception as e:
@@ -458,12 +461,13 @@ class App(tk.Tk):
             if cache.get("date") != today or not cache.get("timetable") or not same_school:
                 timetable = main.fetch_timetable(cfg, today)
                 meals = main.fetch_meal(cfg, today)
-                main.save_data_cache(timetable, meals, today, cfg)
+                schedule = main.fetch_school_schedule(cfg, main.datetime.now())
+                main.save_data_cache(timetable, meals, today, cfg, schedule)
 
                 # 렌더링 직전에 다시 한번 최신 설정을 읽어, 그 사이 사용자가 저장한 변경사항을 존중한다
                 latest_cfg = main.load_config() or cfg
                 now = main.datetime.now()
-                path = main.render_wallpaper(latest_cfg, now, timetable, meals)
+                path = main.render_wallpaper(latest_cfg, now, timetable, meals, schedule)
                 main.set_wallpaper(path)
                 main.ensure_autostart()
                 self.after(0, lambda: self.status_var.set("오늘 날짜 시간표/급식 동기화 완료 ✓"))
@@ -509,7 +513,7 @@ class App(tk.Tk):
         self.sync_effects.set(True)
         
         # 3. 각 섹션 변수를 DEFAULT_SECTIONS 기본값으로 리셋
-        for s in ["school_info", "timetable", "meals", "date_info"]:
+        for s in ["school_info", "timetable", "meals", "date_info", "dday"]:
             sec_def = DEFAULT_SECTIONS[s]
             for key, val in sec_def.items():
                 if key in self.sec_vars[s]:
@@ -645,7 +649,7 @@ class App(tk.Tk):
         
         # 섹션 설정 수집
         sections_data = {}
-        for s in ["school_info", "timetable", "meals", "date_info"]:
+        for s in ["school_info", "timetable", "meals", "date_info", "dday"]:
             sections_data[s] = {
                 "show": self.sec_vars[s]["show"].get(),
                 "x": self.sec_vars[s]["x"].get(),

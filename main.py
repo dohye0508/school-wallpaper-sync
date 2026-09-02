@@ -15,7 +15,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -107,7 +107,9 @@ DEFAULT_COLORS = {
     "meals_type": "#FF968C",
     "meals_dish": "#FFFFFF",
     "date_weekday": "#CDC3FF",
-    "date_calendar": "#D2D5E0"
+    "date_calendar": "#D2D5E0",
+    "dday_label": "#FFD166",
+    "dday_name": "#FFFFFF"
 }
 
 DEFAULT_TEXT_EFFECTS = {
@@ -129,7 +131,7 @@ DEFAULT_SECTIONS = {
     },
     "timetable": {
         "x": 50,
-        "y": 15,
+        "y": 19,
         "show": True,
         "stroke_width": 0,
         "shadow_blur": 5,
@@ -153,6 +155,15 @@ DEFAULT_SECTIONS = {
         "shadow_blur": 5,
         "shadow_opacity": 100,
         "font_size": 157
+    },
+    "dday": {
+        "x": 50,
+        "y": 14,
+        "show": True,
+        "stroke_width": 0,
+        "shadow_blur": 5,
+        "shadow_opacity": 100,
+        "font_size": 100
     }
 }
 
@@ -201,7 +212,7 @@ def hex_to_rgba(hex_str, alpha=255):
         return (r, g, b, a)
     return (255, 255, 255, alpha)
 
-def save_data_cache(timetable, meals, ymd=None, cfg=None):
+def save_data_cache(timetable, meals, ymd=None, cfg=None, schedule=None):
     os.makedirs(os.path.dirname(DATA_CACHE_PATH), exist_ok=True)
     if ymd is None:
         ymd = datetime.now().strftime("%Y%m%d")
@@ -209,6 +220,7 @@ def save_data_cache(timetable, meals, ymd=None, cfg=None):
         "date": ymd,
         "timetable": timetable,
         "meals": meals,
+        "schedule": schedule,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         # 어느 학교/학년/반의 데이터인지 함께 기록해서, 학교를 바꿨는데도
         # "오늘 날짜"라는 이유만으로 이전 학교의 캐시를 재사용하는 것을 방지한다
@@ -244,13 +256,14 @@ def load_data_cache(cfg=None):
         try:
             timetable = fetch_timetable(cfg, today)
             meals = fetch_meal(cfg, today)
-            save_data_cache(timetable, meals, today, cfg)
-            return {"date": today, "timetable": timetable, "meals": meals,
+            schedule = fetch_school_schedule(cfg, datetime.now())
+            save_data_cache(timetable, meals, today, cfg, schedule)
+            return {"date": today, "timetable": timetable, "meals": meals, "schedule": schedule,
                     "school_code": cfg.get("school_code"), "grade": cfg.get("grade"), "classnm": cfg.get("classnm")}
         except Exception as e:
             print(f"[오늘 데이터 자동 조회 실패] {e}")
 
-    return {"date": today, "timetable": [], "meals": []}
+    return {"date": today, "timetable": [], "meals": [], "schedule": None}
 
 
 def ensure_autostart():
@@ -468,6 +481,57 @@ def fetch_timetable(cfg, ymd):
         return []
 
 
+GRADE_EVENT_FLAG = {
+    "1": "ONE_GRADE_EVENT_YN", "2": "TW_GRADE_EVENT_YN", "3": "THREE_GRADE_EVENT_YN",
+    "4": "FR_GRADE_EVENT_YN", "5": "FIV_GRADE_EVENT_YN", "6": "SIX_GRADE_EVENT_YN",
+}
+# 매주 반복되는 토요/일요 휴업일은 "다가오는 학사일정" 으로서 의미가 없어 제외한다
+SCHEDULE_EXCLUDE_NAMES = {"토요휴업일", "일요휴업일"}
+
+
+def fetch_school_schedule(cfg, today):
+    """오늘 이후 가장 가까운 학사일정(시험, 방학, 공휴일 등)을 D-day와 함께 반환한다.
+    NEIS SchoolSchedule API 사용. 학교가 등록한 일정이 없으면 None을 반환한다."""
+    ymd = today.strftime("%Y%m%d")
+    to_ymd = (today + timedelta(days=120)).strftime("%Y%m%d")
+    try:
+        data = neis_get(
+            "SchoolSchedule",
+            {
+                "KEY": cfg["api_key"],
+                "Type": "json",
+                "ATPT_OFCDC_SC_CODE": cfg["edu_code"],
+                "SD_SCHUL_CODE": cfg["school_code"],
+                "AA_FROM_YMD": ymd,
+                "AA_TO_YMD": to_ymd,
+            },
+        )
+        if "SchoolSchedule" not in data:
+            return None
+        rows = data["SchoolSchedule"][1]["row"]
+    except Exception as e:
+        print(f"[학사일정 조회 실패] {e}")
+        return None
+
+    grade_flag = GRADE_EVENT_FLAG.get(str(cfg.get("grade")))
+    candidates = [
+        r for r in rows
+        if r.get("EVENT_NM") not in SCHEDULE_EXCLUDE_NAMES
+        and (not grade_flag or r.get(grade_flag) in ("Y", "*"))
+    ]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda r: r["AA_YMD"])
+    nearest = candidates[0]
+    event_date = datetime.strptime(nearest["AA_YMD"], "%Y%m%d").date()
+    return {
+        "name": nearest["EVENT_NM"],
+        "date": nearest["AA_YMD"],
+        "dday": (event_date - today.date()).days,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 바탕화면 이미지 렌더링
 # ---------------------------------------------------------------------------
@@ -583,7 +647,7 @@ def spaced(text):
     return " ".join(list(text))
 
 
-def render_wallpaper(cfg, now, timetable, meals):
+def render_wallpaper(cfg, now, timetable, meals, schedule=None):
     W, H = get_screen_size()
 
     bg = fetch_background(cfg, now, W, H)
@@ -631,11 +695,13 @@ def render_wallpaper(cfg, now, timetable, meals):
     s_tt = sections.get("timetable", DEFAULT_SECTIONS["timetable"])
     s_meals = sections.get("meals", DEFAULT_SECTIONS["meals"])
     s_date = sections.get("date_info", DEFAULT_SECTIONS["date_info"])
+    s_dday = sections.get("dday", DEFAULT_SECTIONS["dday"])
 
     info_scale = float(s_info.get("font_size", 100)) / 100.0
     tt_scale = float(s_tt.get("font_size", 100)) / 100.0
     meals_scale = float(s_meals.get("font_size", 100)) / 100.0
     date_scale = float(s_date.get("font_size", 100)) / 100.0
+    dday_scale = float(s_dday.get("font_size", 100)) / 100.0
 
     school_name_font = font(FONT_BOLD, int(H * 0.024 * info_scale))
     class_font = font(FONT_REGULAR, int(H * 0.016 * info_scale))
@@ -650,6 +716,9 @@ def render_wallpaper(cfg, now, timetable, meals):
     
     date_weekday_font = font(FONT_BOLD, int(H * 0.022 * date_scale))
     date_calendar_font = font(FONT_REGULAR, int(H * 0.018 * date_scale))
+
+    dday_label_font = font(FONT_BOLD, int(H * 0.024 * dday_scale))
+    dday_name_font = font(FONT_REGULAR, int(H * 0.018 * dday_scale))
 
     tt_row_gap = int(H * 0.035 * tt_scale)
     meal_line_gap = int(H * 0.026 * meals_scale)
@@ -712,7 +781,7 @@ def render_wallpaper(cfg, now, timetable, meals):
                     draw_text_with_effects(line, col_cx, dy, dish_font, colors["meals_dish"], s_meals)
                     dy += meal_line_gap
         else:
-            draw_text_with_effects("등록된 급식 정보가 없습니다", dish_font, colors["meals_dish"], s_meals)
+            draw_text_with_effects("등록된 급식 정보가 없습니다", mx, my, dish_font, colors["meals_dish"], s_meals)
 
     # ---- 4. 날짜 정보 섹션 ----
     if s_date.get("show", True):
@@ -723,6 +792,16 @@ def render_wallpaper(cfg, now, timetable, meals):
         draw_two_tone_with_effects(weekday_str, date_weekday_font, colors["date_weekday"],
                                    date_str, date_calendar_font, colors["date_calendar"],
                                    dx, dy, s_date, gap=int(16 * date_scale))
+
+    # ---- 5. 학사일정 D-Day 섹션 ----
+    if s_dday.get("show", True) and schedule:
+        ddx = int(W * s_dday.get("x", 50) / 100)
+        ddy = int(H * s_dday.get("y", 11) / 100)
+        dday_n = schedule.get("dday", 0)
+        label = "D-DAY" if dday_n == 0 else f"D-{dday_n}"
+        draw_two_tone_with_effects(label, dday_label_font, colors["dday_label"],
+                                   schedule.get("name", ""), dday_name_font, colors["dday_name"],
+                                   ddx, ddy, s_dday, gap=int(14 * dday_scale))
 
     # 3단계: 그림자 블러 레이어 생성 및 합성 (활성화된 섹션 중 최대 블러 반경 기준)
     max_shadow_b = 0.0
@@ -789,12 +868,14 @@ def update_once(cfg):
     ymd = now.strftime("%Y%m%d")
     meals = fetch_meal(cfg, ymd)
     timetable = fetch_timetable(cfg, ymd)
-    save_data_cache(timetable, meals, ymd, cfg) # 로컬 캐시 갱신
-    path = render_wallpaper(cfg, now, timetable, meals)
+    schedule = fetch_school_schedule(cfg, now)
+    save_data_cache(timetable, meals, ymd, cfg, schedule) # 로컬 캐시 갱신
+    path = render_wallpaper(cfg, now, timetable, meals, schedule)
     set_wallpaper(path)
     ensure_autostart() # 윈도우 시작 시 자동 실행 등록
     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 바탕화면 갱신 완료 "
-          f"(시간표 {len(timetable)}건, 급식 {len(meals)}건)")
+          f"(시간표 {len(timetable)}건, 급식 {len(meals)}건, "
+          f"학사일정 {'D' + ('-DAY' if schedule['dday'] == 0 else str(schedule['dday'])) if schedule else '없음'})")
 
 
 def main():
