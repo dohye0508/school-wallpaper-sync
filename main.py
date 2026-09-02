@@ -181,6 +181,7 @@ DEFAULT_CONFIG = {
     "bg_photo_mode": "auto",
     "bg_photo_idx": 0,
     "dday_count": 3,
+    "manual_dday": [],  # [{"name": "중간고사", "date": "20261020", "color": "#FF6B6B" 또는 None}, ...]
     "font_colors": DEFAULT_COLORS,
     "text_effects": DEFAULT_TEXT_EFFECTS,
     "sections": DEFAULT_SECTIONS
@@ -837,8 +838,25 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
                                    date_str, date_calendar_font, colors["date_calendar"],
                                    dx, dy, s_date, gap=int(16 * date_scale))
 
-    # ---- 5. 학사일정 D-Day 섹션 (가까운 순으로 최대 3개, 한 줄에 오른쪽 정렬) ----
-    dday_events = schedule if isinstance(schedule, list) else ([schedule] if schedule else [])
+    # ---- 5. 학사일정 D-Day 섹션 (NEIS 자동 조회 + 수동 입력을 합쳐 가까운 순으로 정렬,
+    #         최대 dday_count개, 한 줄에 오른쪽 정렬) ----
+    dday_events = list(schedule) if isinstance(schedule, list) else ([schedule] if schedule else [])
+    for m in cfg.get("manual_dday", []) or []:
+        try:
+            m_date = datetime.strptime(m["date"], "%Y%m%d").date()
+            dday_n = (m_date - now.date()).days
+            if dday_n < 0:
+                continue  # 이미 지난 수동 일정은 표시하지 않는다
+            dday_events.append({
+                "name": m.get("name", ""),
+                "date": m["date"],
+                "dday": dday_n,
+                "color": m.get("color") or None,
+            })
+        except Exception:
+            continue
+    dday_events.sort(key=lambda e: e.get("dday", 9999))
+
     if s_dday.get("show", True) and dday_events:
         ddx = int(W * s_dday.get("x", 90) / 100)
         ddy = int(H * s_dday.get("y", 90) / 100)
@@ -851,7 +869,8 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
             dday_n = ev.get("dday", 0)
             label = "D-DAY" if dday_n == 0 else f"D-{dday_n}"
             is_last = i == len(events) - 1
-            parts.append((label, dday_label_font, colors["dday_label"], inner_gap))
+            label_color = hex_to_rgba(ev["color"]) if ev.get("color") else colors["dday_label"]
+            parts.append((label, dday_label_font, label_color, inner_gap))
             parts.append((ev.get("name", ""), dday_name_font, colors["dday_name"], 0 if is_last else event_gap))
         draw_multi_tone_with_effects(parts, ddx, ddy, s_dday, align="right")
 

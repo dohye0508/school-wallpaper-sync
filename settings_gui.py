@@ -249,8 +249,8 @@ class App(tk.Tk):
         ]
 
         for kr_name, sec_key in sections_info:
-            sec_frame = ttk.Frame(sub_notebook)
-            sub_notebook.add(sec_frame, text=f" {kr_name} ")
+            tab_container, sec_frame = self.make_scrollable_tab(sub_notebook)
+            sub_notebook.add(tab_container, text=f" {kr_name} ")
 
             sec_cfg = sections_cfg.get(sec_key, DEFAULT_SECTIONS[sec_key])
             
@@ -322,13 +322,43 @@ class App(tk.Tk):
             op_slider.set(vars_dict["shadow_opacity"].get())
             ttk.Label(sec_frame, textvariable=self.label_vars[sec_key]["shadow_opacity"]).grid(row=6, column=2, padx=5, sticky="w")
 
-            # 7. 학사일정만 표시 개수 지정 가능 (최대 5개, 기본 3개)
+            # 7. 학사일정만 표시 개수 지정 가능 (최대 10개, 기본 3개)
             if sec_key == "dday":
                 ttk.Label(sec_frame, text="표시 개수 (최대 10)").grid(row=7, column=0, sticky="w", padx=10, pady=2)
                 self.dday_count_var = tk.IntVar(value=self.cfg.get("dday_count", 3))
                 count_spin = ttk.Spinbox(sec_frame, from_=1, to=10, textvariable=self.dday_count_var, width=5,
                                           command=self.trigger_live_apply)
                 count_spin.grid(row=7, column=1, sticky="w", padx=10, pady=2)
+
+                # 8. 수동 학사일정 (NEIS에 없는 시험 등을 직접 추가) — 있으면 자동 조회분과
+                #    합쳐서 날짜순으로 표시된다. 개별 색상 지정 가능(기본은 노란색과 동일)
+                ttk.Separator(sec_frame, orient="horizontal").grid(row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=6)
+                ttk.Label(sec_frame, text="수동으로 추가한 학사일정 (NEIS에 없는 시험 등)",
+                          font=("맑은 고딕", 10, "bold")).grid(row=9, column=0, columnspan=3, sticky="w", padx=10)
+
+                self.manual_dday = [dict(m) for m in (self.cfg.get("manual_dday") or [])]
+                self.manual_list = tk.Listbox(sec_frame, height=4, width=48, font=("맑은 고딕", 10))
+                self.manual_list.grid(row=10, column=0, columnspan=3, sticky="w", padx=10, pady=3)
+                self._refresh_manual_dday_list()
+
+                add_row = ttk.Frame(sec_frame)
+                add_row.grid(row=11, column=0, columnspan=3, sticky="w", padx=10, pady=2)
+                ttk.Label(add_row, text="이름").pack(side="left")
+                self.manual_name_var = tk.StringVar()
+                ttk.Entry(add_row, textvariable=self.manual_name_var, width=12).pack(side="left", padx=(4, 10))
+                ttk.Label(add_row, text="날짜(YYYY-MM-DD)").pack(side="left")
+                self.manual_date_var = tk.StringVar()
+                ttk.Entry(add_row, textvariable=self.manual_date_var, width=12).pack(side="left", padx=(4, 10))
+
+                self.manual_color_var = tk.StringVar(value="")  # 비어있으면 기본 노란색
+                self.manual_color_btn = tk.Button(add_row, text="기본색", width=7, command=self.on_pick_manual_color)
+                self.manual_color_btn.pack(side="left", padx=(0, 10))
+                self._default_button_bg = self.manual_color_btn.cget("bg")
+
+                btn_row2 = ttk.Frame(sec_frame)
+                btn_row2.grid(row=12, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+                ttk.Button(btn_row2, text="추가", command=self.on_add_manual_dday).pack(side="left", padx=(0, 6))
+                ttk.Button(btn_row2, text="선택 삭제", command=self.on_remove_manual_dday).pack(side="left")
 
         # ----------------------------------------------------
         # 공통 하단 영역
@@ -365,6 +395,27 @@ class App(tk.Tk):
         self.deiconify()
         self.lift()
         self.focus_force()
+
+    def make_scrollable_tab(self, parent):
+        """섹션 탭 안에 위젯이 많아져도(예: 수동 학사일정 목록) 창 높이를 넘어가면
+        스크롤로 볼 수 있도록 캔버스+스크롤바로 감싼 컨테이너를 만든다.
+        parent에 넣을 컨테이너와, 그 안에 실제 위젯을 채울 내부 프레임을 반환한다."""
+        container = ttk.Frame(parent)
+        canvas = tk.Canvas(container, highlightthickness=0)
+        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        return container, inner
 
     def make_slider_callback(self, sec_name, key, var):
         def callback(val):
@@ -415,6 +466,54 @@ class App(tk.Tk):
         except (tk.TclError, ValueError):
             return self.cfg.get("dday_count", 3)
 
+    def _refresh_manual_dday_list(self):
+        self.manual_list.delete(0, tk.END)
+        for m in self.manual_dday:
+            date_disp = m["date"]
+            if len(date_disp) == 8:
+                date_disp = f"{date_disp[:4]}-{date_disp[4:6]}-{date_disp[6:]}"
+            color_disp = m["color"] if m.get("color") else "기본색"
+            self.manual_list.insert(tk.END, f"{m['name']}  ({date_disp})  [{color_disp}]")
+
+    def on_pick_manual_color(self):
+        _, hex_val = colorchooser.askcolor(self.manual_color_var.get() or "#FF6B6B",
+                                            parent=self, title="이 학사일정만의 색상 선택")
+        if hex_val:
+            self.manual_color_var.set(hex_val)
+            self.manual_color_btn.config(text=hex_val, bg=hex_val)
+
+    def on_add_manual_dday(self):
+        name = self.manual_name_var.get().strip()
+        date_raw = self.manual_date_var.get().strip().replace("-", "").replace("/", "").replace(".", "")
+        if not name or not date_raw:
+            messagebox.showwarning("입력 필요", "이름과 날짜를 모두 입력해주세요.")
+            return
+        try:
+            main.datetime.strptime(date_raw, "%Y%m%d")
+        except ValueError:
+            messagebox.showwarning("날짜 형식 오류", "날짜는 YYYY-MM-DD 형식으로 입력해주세요. (예: 2026-10-20)")
+            return
+
+        self.manual_dday.append({
+            "name": name,
+            "date": date_raw,
+            "color": self.manual_color_var.get() or None,
+        })
+        self._refresh_manual_dday_list()
+        self.manual_name_var.set("")
+        self.manual_date_var.set("")
+        self.manual_color_var.set("")
+        self.manual_color_btn.config(text="기본색", bg=self._default_button_bg)
+        self.trigger_live_apply()
+
+    def on_remove_manual_dday(self):
+        selection = self.manual_list.curselection()
+        if not selection:
+            return
+        del self.manual_dday[selection[0]]
+        self._refresh_manual_dday_list()
+        self.trigger_live_apply()
+
     def perform_live_apply(self):
         self.pending_apply = None
 
@@ -441,6 +540,7 @@ class App(tk.Tk):
             "bg_photo_idx": self.preset_combo.current(),
             "custom_background": self.photo_path.get().strip() or None,
             "dday_count": self._safe_dday_count(),
+            "manual_dday": self.manual_dday,
             "font_colors": font_colors,
             "sections": sections_data
         }
@@ -667,6 +767,7 @@ class App(tk.Tk):
         new_cfg["bg_photo_idx"] = self.preset_combo.current()
         new_cfg["custom_background"] = self.photo_path.get().strip() or None
         new_cfg["dday_count"] = self._safe_dday_count()
+        new_cfg["manual_dday"] = self.manual_dday
 
         new_cfg["font_colors"] = {k: v.get() for k, v in self.colors_vars.items()}
         
