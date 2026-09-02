@@ -64,7 +64,7 @@ class App(tk.Tk):
         self.title("학교 바탕화면 설정")
         self.resizable(False, False)
         # 창 크기 조정 (Y축 길이를 늘려 저장/초기화/닫기 버튼이 시원하게 보이도록 여백 확보)
-        self.geometry("590x693")
+        self.geometry("590x720")
         try:
             icon_path = os.path.join(main.ROOT_DIR, "icon.ico")
             if os.path.exists(icon_path):
@@ -324,9 +324,9 @@ class App(tk.Tk):
 
             # 7. 학사일정만 표시 개수 지정 가능 (최대 5개, 기본 3개)
             if sec_key == "dday":
-                ttk.Label(sec_frame, text="표시 개수 (최대 5)").grid(row=7, column=0, sticky="w", padx=10, pady=2)
+                ttk.Label(sec_frame, text="표시 개수 (최대 10)").grid(row=7, column=0, sticky="w", padx=10, pady=2)
                 self.dday_count_var = tk.IntVar(value=self.cfg.get("dday_count", 3))
-                count_spin = ttk.Spinbox(sec_frame, from_=1, to=5, textvariable=self.dday_count_var, width=5,
+                count_spin = ttk.Spinbox(sec_frame, from_=1, to=10, textvariable=self.dday_count_var, width=5,
                                           command=self.trigger_live_apply)
                 count_spin.grid(row=7, column=1, sticky="w", padx=10, pady=2)
 
@@ -353,7 +353,7 @@ class App(tk.Tk):
         # update_idletasks()만으로는 Notebook처럼 크기 협상이 한 틱 늦게 끝나는
         # 위젯이 있어 완전히 반영되지 않는 경우가 있어 update()로 강제로 다 처리한다.
         self.update()
-        w, h = 590, 693
+        w, h = 590, 720
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         x, y = (sw - w) // 2, (sh - h) // 2
         # 내용물이 늘어나도 창 자체는 이 크기를 넘지 못하도록 위/아래 크기를 고정한다
@@ -411,7 +411,7 @@ class App(tk.Tk):
         # 스핀박스에 직접 숫자를 지우고 타이핑하는 중처럼 값이 비어있거나
         # 숫자가 아닐 때 IntVar.get()이 TclError를 던지는 걸 방지한다
         try:
-            return max(1, min(5, int(self.dday_count_var.get())))
+            return max(1, min(10, int(self.dday_count_var.get())))
         except (tk.TclError, ValueError):
             return self.cfg.get("dday_count", 3)
 
