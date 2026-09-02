@@ -480,6 +480,20 @@ def fetch_timetable(cfg, ymd):
 # ---------------------------------------------------------------------------
 
 TEACHER_CACHE_PATH = os.path.join(BASE_DIR, "teacher_cache.json")
+TEACHER_STATUS_PATH = os.path.join(BASE_DIR, "teacher_status.json")
+
+
+def write_teacher_status(ok, message):
+    """--windowed 빌드는 콘솔이 없어 print()가 어디에도 안 보이므로, 설정 GUI가
+    읽어서 사용자에게 보여줄 수 있도록 결과를 파일로 남긴다."""
+    try:
+        with open(TEACHER_STATUS_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {"ok": ok, "message": message, "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                f, ensure_ascii=False,
+            )
+    except Exception:
+        pass
 
 
 def fetch_teacher_names(cfg, now):
@@ -496,6 +510,7 @@ def fetch_teacher_names(cfg, now):
             if cache.get("key") == cache_key and cache.get("week") == week_tag:
                 week_data = cache.get("week_data")
                 if week_data:
+                    write_teacher_status(True, "캐시된 결과 사용")
                     return week_data[now.weekday()]
         except Exception:
             pass
@@ -534,12 +549,15 @@ def fetch_teacher_names(cfg, now):
                 json.dump({"key": cache_key, "week": week_tag, "week_data": week_data}, f, ensure_ascii=False)
         except Exception:
             pass
+        write_teacher_status(True, "컴시간 조회 성공")
         return week_data[now.weekday()]
 
     if t.is_alive():
-        print("[컴시간 선생님 이름 조회 시간 초과 - 무시하고 진행]")
+        msg = "컴시간 서버 응답이 없어 6초 만에 포기했습니다"
     else:
-        print(f"[컴시간 선생님 이름 조회 실패 - 무시하고 진행] {result.get('error')}")
+        msg = f"컴시간 조회 실패: {result.get('error')}"
+    print(f"[{msg} - 무시하고 진행]")
+    write_teacher_status(False, msg)
     return None
 
 

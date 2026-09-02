@@ -438,12 +438,17 @@ class App(tk.Tk):
         threading.Thread(target=self._render_live_apply, args=(cfg,), daemon=True).start()
 
     def _render_live_apply(self, cfg):
+        start_ts = main.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             cache = main.load_data_cache(self.cfg)
             now = main.datetime.now()
             path = main.render_wallpaper(cfg, now, cache.get("timetable", []), cache.get("meals", []))
             main.set_wallpaper(path)
-            self.after(0, lambda: self.status_var.set("바탕화면 실시간 반영됨 ✓"))
+            text = "바탕화면 실시간 반영됨 ✓"
+            teacher_msg = self._read_teacher_status(start_ts, cfg.get("show_teacher_name", False))
+            if teacher_msg is not None and not teacher_msg.get("ok"):
+                text += f" — 선생님 이름 표시 실패: {teacher_msg.get('message')}"
+            self.after(0, lambda: self.status_var.set(text))
         except Exception as e:
             print(f"[실시간 적용 실패] {e}")
 
@@ -684,30 +689,54 @@ class App(tk.Tk):
 
         self.apply_btn.config(state="disabled")
         self.status_var.set("적용 중... (사진/시간표/급식을 가져오는 중)")
-        threading.Thread(target=self._run_engine, daemon=True).start()
+        threading.Thread(target=self._run_engine, args=(self.show_teacher_var.get(),), daemon=True).start()
 
-    def _run_engine(self):
+    def _run_engine(self, show_teacher):
+        start_ts = main.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             creationflags = 0
             if sys.platform == "win32":
                 creationflags = subprocess.CREATE_NO_WINDOW
-            
+
             # Use sys.executable (which is this .exe if bundled) with --background flag
             cmd = [sys.executable, "--background"]
             if not getattr(sys, "frozen", False):
                 cmd = [sys.executable, "app.py", "--background"]
-                
+
             result = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=creationflags)
             ok = result.returncode == 0
         except Exception as e:
             ok = False
             print(e)
-        self.after(0, self._on_engine_done, ok)
+        teacher_msg = self._read_teacher_status(start_ts, show_teacher)
+        self.after(0, self._on_engine_done, ok, teacher_msg)
 
-    def _on_engine_done(self, ok):
+    def _read_teacher_status(self, start_ts, enabled):
+        """--windowed 빌드는 콘솔이 없어서 컴시간 조회 결과를 print()로는 볼 수 없다.
+        main.py가 남긴 상태 파일을, 이번 실행 이후에 쓰인 것만 골라 읽어온다.
+        (백그라운드 스레드에서 호출되므로 Tkinter 변수는 여기서 직접 읽지 않고
+        호출부가 메인 스레드에서 미리 읽어 전달한 값을 받는다.)"""
+        if not enabled:
+            return None
+        try:
+            with open(main.TEACHER_STATUS_PATH, "r", encoding="utf-8") as f:
+                status = json.load(f)
+            if status.get("at", "") >= start_ts:
+                return status
+        except Exception:
+            pass
+        return None
+
+    def _on_engine_done(self, ok, teacher_msg=None):
         self.apply_btn.config(state="normal")
         if ok:
-            self.status_var.set("바탕화면에 적용되었습니다 ✓")
+            text = "바탕화면에 적용되었습니다 ✓"
+            if teacher_msg is not None:
+                if teacher_msg.get("ok"):
+                    text += " (선생님 이름 표시됨)"
+                else:
+                    text += f" — 선생님 이름 표시 실패: {teacher_msg.get('message')}"
+            self.status_var.set(text)
         else:
             self.status_var.set("적용 실패 — 설정을 다시 확인해주세요")
             messagebox.showerror("적용 실패", "바탕화면 적용 중 오류가 발생했습니다. 입력값을 확인해주세요.")
