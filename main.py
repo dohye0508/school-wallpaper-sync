@@ -169,6 +169,7 @@ DEFAULT_CONFIG = {
     "custom_background": None,
     "bg_photo_mode": "auto",
     "bg_photo_idx": 0,
+    "show_teacher_name": False,
     "font_colors": DEFAULT_COLORS,
     "text_effects": DEFAULT_TEXT_EFFECTS,
     "sections": DEFAULT_SECTIONS
@@ -469,6 +470,100 @@ def fetch_timetable(cfg, ymd):
 
 
 # ---------------------------------------------------------------------------
+# 컴시간(Comcigan) 선생님 이름 — NEIS 공개 API에는 담당 교사 정보가 없어서,
+# 켜져 있을 때만 비공식 컴시간 라이브러리로 보조 조회한다. 이 라이브러리는
+# import 시점에 곧바로 컴시간 서버로 네트워크 요청을 보내는 데다, 비공식
+# 서비스(고정 IP, 비HTTPS)라 언제든 끊기거나 막힐 수 있다. 그래서 반드시
+# 지연 import + 광범위한 예외처리로 감싸서, 실패해도 NEIS 시간표(과목명만)는
+# 항상 정상적으로 나오도록 한다. 요일/교시 기준 "정규 주간 시간표"라서 보강・
+# 시험 등으로 오늘 시간표가 바뀐 경우 선생님 이름이 실제와 다를 수 있다.
+# ---------------------------------------------------------------------------
+
+TEACHER_CACHE_PATH = os.path.join(BASE_DIR, "teacher_cache.json")
+
+
+def fetch_teacher_names(cfg, now):
+    """오늘 요일 기준 교시별 담당 선생님 이름 리스트(1교시부터 순서대로)를 반환한다.
+    실패하면(비공식 서비스 접속 불가, 학교 미등록 등) 무조건 None을 반환한다."""
+    cache_key = f"{cfg.get('school_name')}|{cfg.get('grade')}|{cfg.get('classnm')}"
+    iso_year, iso_week, _ = now.isocalendar()
+    week_tag = f"{iso_year}-{iso_week}"
+
+    if os.path.exists(TEACHER_CACHE_PATH):
+        try:
+            with open(TEACHER_CACHE_PATH, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            if cache.get("key") == cache_key and cache.get("week") == week_tag:
+                week_data = cache.get("week_data")
+                if week_data:
+                    return week_data[now.weekday()]
+        except Exception:
+            pass
+
+    # 컴시간 라이브러리는 자체 requests 호출에 timeout을 안 걸어서(확인 결과
+    # socket.setdefaulttimeout()도 무시하고 20초 넘게 멈추는 경우가 있었다),
+    # 별도 스레드에서 돌리고 일정 시간 안에 안 끝나면 그냥 포기(watchdog)한다.
+    # 그 스레드 자체는 백그라운드에서 계속 시도하다 죽겠지만, 데몬 스레드라
+    # 어차피 이 프로그램은 렌더링 직후 곧 종료되므로 문제되지 않는다.
+    import threading as _threading
+
+    result = {}
+
+    def _do_fetch():
+        try:
+            import comcigan  # 지연 import: 이 시점에만 컴시간 서버로 접속을 시도한다
+
+            school = comcigan.School(cfg["school_name"])
+            grade = int(cfg["grade"])
+            class_idx = int(cfg["classnm"]) - 1
+            week_data = [
+                [t[2] for t in school[grade][class_idx][d]] for d in range(5)
+            ]
+            result["week_data"] = week_data
+        except Exception as e:
+            result["error"] = str(e)
+
+    t = _threading.Thread(target=_do_fetch, daemon=True)
+    t.start()
+    t.join(timeout=6)
+
+    if not t.is_alive() and "week_data" in result:
+        week_data = result["week_data"]
+        try:
+            with open(TEACHER_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"key": cache_key, "week": week_tag, "week_data": week_data}, f, ensure_ascii=False)
+        except Exception:
+            pass
+        return week_data[now.weekday()]
+
+    if t.is_alive():
+        print("[컴시간 선생님 이름 조회 시간 초과 - 무시하고 진행]")
+    else:
+        print(f"[컴시간 선생님 이름 조회 실패 - 무시하고 진행] {result.get('error')}")
+    return None
+
+
+def apply_teacher_names(cfg, timetable, now):
+    """설정이 켜져 있으면 '과목명(선생님)' 형태로 보강한다. 실패해도 원본을 그대로 반환한다."""
+    if not cfg.get("show_teacher_name") or not timetable:
+        return timetable
+    try:
+        teachers = fetch_teacher_names(cfg, now)
+        if not teachers:
+            return timetable
+        for t in timetable:
+            try:
+                idx = int(t["period"]) - 1
+            except (ValueError, TypeError):
+                continue
+            if 0 <= idx < len(teachers) and teachers[idx]:
+                t["subject"] = f"{t['subject']}({teachers[idx]})"
+    except Exception as e:
+        print(f"[선생님 이름 보강 실패 - 무시하고 진행] {e}")
+    return timetable
+
+
+# ---------------------------------------------------------------------------
 # 바탕화면 이미지 렌더링
 # ---------------------------------------------------------------------------
 
@@ -585,6 +680,9 @@ def spaced(text):
 
 def render_wallpaper(cfg, now, timetable, meals):
     W, H = get_screen_size()
+
+    # 원본(캐시된) 리스트를 건드리지 않도록 복사본에 선생님 이름을 보강한다
+    timetable = apply_teacher_names(cfg, [dict(t) for t in timetable], now)
 
     bg = fetch_background(cfg, now, W, H)
     canvas = bg.convert("RGBA")

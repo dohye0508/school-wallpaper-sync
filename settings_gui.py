@@ -131,6 +131,13 @@ class App(tk.Tk):
         self.class_var = tk.StringVar(value=self.cfg.get("classnm", ""))
         ttk.Entry(gc_row, textvariable=self.class_var, width=6).pack(side="left", padx=4)
 
+        self.show_teacher_var = tk.BooleanVar(value=self.cfg.get("show_teacher_name", False))
+        ttk.Checkbutton(
+            tab_basic,
+            text="시간표에 선생님 이름 표시 (예: 고급 미적분(홍길동)) — 컴시간 비공식 연동, 실패 시 자동으로 과목명만 표시",
+            variable=self.show_teacher_var,
+        ).pack(anchor="w", padx=15, pady=(2, 4))
+
         # 구분선 추가
         ttk.Separator(tab_basic, orient="horizontal").pack(fill="x", padx=15, pady=8)
 
@@ -376,7 +383,8 @@ class App(tk.Tk):
         self.photo_mode.trace_add("write", self.trigger_live_apply)
         self.preset_combo.bind("<<ComboboxSelected>>", self.trigger_live_apply)
         self.photo_path.trace_add("write", self.trigger_live_apply)
-        
+        self.show_teacher_var.trace_add("write", self.trigger_live_apply)
+
         # 2. 색상 관련
         for v in self.colors_vars.values():
             v.trace_add("write", self.trigger_live_apply)
@@ -418,17 +426,24 @@ class App(tk.Tk):
             "bg_photo_mode": self.photo_mode.get(),
             "bg_photo_idx": self.preset_combo.current(),
             "custom_background": self.photo_path.get().strip() or None,
+            "show_teacher_name": self.show_teacher_var.get(),
             "font_colors": font_colors,
             "sections": sections_data
         }
         
-        # API 호출 없이 로컬 데이터 캐시만을 이용해 바탕화면 실시간 반영 (100ms 이내)
+        # 렌더링 자체는 스레드에서 수행한다. 선생님 이름 표시가 켜져 있으면
+        # render_wallpaper 내부에서 컴시간(비공식) 조회가 일어날 수 있는데,
+        # 최대 몇 초 걸릴 수 있어 메인 스레드(창)에서 직접 돌리면 그동안
+        # 창 전체가 멈춰 보인다. 스레드로 빼서 창은 계속 반응하게 한다.
+        threading.Thread(target=self._render_live_apply, args=(cfg,), daemon=True).start()
+
+    def _render_live_apply(self, cfg):
         try:
             cache = main.load_data_cache(self.cfg)
             now = main.datetime.now()
             path = main.render_wallpaper(cfg, now, cache.get("timetable", []), cache.get("meals", []))
             main.set_wallpaper(path)
-            self.status_var.set("바탕화면 실시간 반영됨 ✓ (네트워크 호출 없음)")
+            self.after(0, lambda: self.status_var.set("바탕화면 실시간 반영됨 ✓"))
         except Exception as e:
             print(f"[실시간 적용 실패] {e}")
 
@@ -636,7 +651,8 @@ class App(tk.Tk):
         new_cfg["bg_photo_mode"] = self.photo_mode.get()
         new_cfg["bg_photo_idx"] = self.preset_combo.current()
         new_cfg["custom_background"] = self.photo_path.get().strip() or None
-        
+        new_cfg["show_teacher_name"] = self.show_teacher_var.get()
+
         new_cfg["font_colors"] = {k: v.get() for k, v in self.colors_vars.items()}
         
         # 섹션 설정 수집
