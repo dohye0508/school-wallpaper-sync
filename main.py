@@ -523,8 +523,21 @@ def fetch_school_schedule(cfg, today, limit=3):
         return []
 
     candidates.sort(key=lambda r: r["AA_YMD"])
+
+    # 추석/설날처럼 같은 이름의 일정이 연속된 날짜로 여러 줄 등록된 경우, 하나의
+    # 일정으로 묶어서 그 시작일(가장 가까운 D-day) 기준 한 건으로만 취급한다
+    merged = []
+    last_name, last_date = None, None
+    for r in candidates:
+        d = datetime.strptime(r["AA_YMD"], "%Y%m%d").date()
+        if merged and r["EVENT_NM"] == last_name and (d - last_date).days == 1:
+            last_date = d
+            continue
+        merged.append(r)
+        last_name, last_date = r["EVENT_NM"], d
+
     events = []
-    for r in candidates[:limit]:
+    for r in merged[:limit]:
         event_date = datetime.strptime(r["AA_YMD"], "%Y%m%d").date()
         events.append({
             "name": r["EVENT_NM"],
@@ -702,6 +715,24 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
         draw_text_with_effects(part1, x_start, y + (max_ascent - ascent1), font1, color1, section_cfg, align="left")
         draw_text_with_effects(part2, x_start + w1 + gap, y + (max_ascent - ascent2), font2, color2, section_cfg, align="left")
 
+    def draw_multi_tone_with_effects(parts, x, y, section_cfg, align="right"):
+        """parts: [(text, font, color, gap_after_px), ...] 를 한 줄로 이어서 그린다.
+        여러 D-day 항목을 'D-22 추석   D-45 중간고사'처럼 한 줄에 나란히 배치할 때 쓴다."""
+        widths = [text_size(sdraw, t, f)[0] for t, f, _, _ in parts]
+        total = sum(widths) + sum(g for _, _, _, g in parts[:-1])
+        if align == "right":
+            x_start = x - total
+        elif align == "left":
+            x_start = x
+        else:
+            x_start = x - total / 2
+        max_ascent = max(f.getmetrics()[0] for _, f, _, _ in parts)
+        cursor = x_start
+        for (text, fnt, color, gap_after), w in zip(parts, widths):
+            ascent = fnt.getmetrics()[0]
+            draw_text_with_effects(text, cursor, y + (max_ascent - ascent), fnt, color, section_cfg, align="left")
+            cursor += w + gap_after
+
     # 개선된 폰트 크기 및 두께 정의 (KoPubWorld 폰트 최적화 + 개별 font_size 배율 반영)
     s_info = sections.get("school_info", DEFAULT_SECTIONS["school_info"])
     s_tt = sections.get("timetable", DEFAULT_SECTIONS["timetable"])
@@ -805,19 +836,22 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
                                    date_str, date_calendar_font, colors["date_calendar"],
                                    dx, dy, s_date, gap=int(16 * date_scale))
 
-    # ---- 5. 학사일정 D-Day 섹션 (가까운 순으로 최대 3개, 오른쪽 정렬) ----
+    # ---- 5. 학사일정 D-Day 섹션 (가까운 순으로 최대 3개, 한 줄에 오른쪽 정렬) ----
     dday_events = schedule if isinstance(schedule, list) else ([schedule] if schedule else [])
     if s_dday.get("show", True) and dday_events:
         ddx = int(W * s_dday.get("x", 90) / 100)
         ddy = int(H * s_dday.get("y", 90) / 100)
-        dday_line_gap = int(H * 0.032 * dday_scale)
-        for i, ev in enumerate(dday_events[:3]):
+        inner_gap = int(14 * dday_scale)   # "D-22" <-> "추석" 사이
+        event_gap = int(30 * dday_scale)   # 서로 다른 일정끼리의 간격
+        events = dday_events[:3]
+        parts = []
+        for i, ev in enumerate(events):
             dday_n = ev.get("dday", 0)
             label = "D-DAY" if dday_n == 0 else f"D-{dday_n}"
-            draw_two_tone_with_effects(label, dday_label_font, colors["dday_label"],
-                                       ev.get("name", ""), dday_name_font, colors["dday_name"],
-                                       ddx, ddy + i * dday_line_gap, s_dday,
-                                       gap=int(14 * dday_scale), align="right")
+            is_last = i == len(events) - 1
+            parts.append((label, dday_label_font, colors["dday_label"], inner_gap))
+            parts.append((ev.get("name", ""), dday_name_font, colors["dday_name"], 0 if is_last else event_gap))
+        draw_multi_tone_with_effects(parts, ddx, ddy, s_dday, align="right")
 
     # 3단계: 그림자 블러 레이어 생성 및 합성 (활성화된 섹션 중 최대 블러 반경 기준)
     max_shadow_b = 0.0
