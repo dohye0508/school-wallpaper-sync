@@ -131,13 +131,6 @@ class App(tk.Tk):
         self.class_var = tk.StringVar(value=self.cfg.get("classnm", ""))
         ttk.Entry(gc_row, textvariable=self.class_var, width=6).pack(side="left", padx=4)
 
-        self.show_teacher_var = tk.BooleanVar(value=self.cfg.get("show_teacher_name", False))
-        ttk.Checkbutton(
-            tab_basic,
-            text="시간표에 선생님 이름 표시 (예: 고급 미적분(홍길동)) — 컴시간 비공식 연동, 실패 시 자동으로 과목명만 표시",
-            variable=self.show_teacher_var,
-        ).pack(anchor="w", padx=15, pady=(2, 4))
-
         # 구분선 추가
         ttk.Separator(tab_basic, orient="horizontal").pack(fill="x", padx=15, pady=8)
 
@@ -383,7 +376,6 @@ class App(tk.Tk):
         self.photo_mode.trace_add("write", self.trigger_live_apply)
         self.preset_combo.bind("<<ComboboxSelected>>", self.trigger_live_apply)
         self.photo_path.trace_add("write", self.trigger_live_apply)
-        self.show_teacher_var.trace_add("write", self.trigger_live_apply)
 
         # 2. 색상 관련
         for v in self.colors_vars.values():
@@ -426,29 +418,21 @@ class App(tk.Tk):
             "bg_photo_mode": self.photo_mode.get(),
             "bg_photo_idx": self.preset_combo.current(),
             "custom_background": self.photo_path.get().strip() or None,
-            "show_teacher_name": self.show_teacher_var.get(),
             "font_colors": font_colors,
             "sections": sections_data
         }
-        
-        # 렌더링 자체는 스레드에서 수행한다. 선생님 이름 표시가 켜져 있으면
-        # render_wallpaper 내부에서 컴시간(비공식) 조회가 일어날 수 있는데,
-        # 최대 몇 초 걸릴 수 있어 메인 스레드(창)에서 직접 돌리면 그동안
-        # 창 전체가 멈춰 보인다. 스레드로 빼서 창은 계속 반응하게 한다.
+
+        # 렌더링(사진 다운로드 등)이 몇 초 걸릴 수 있어, 메인 스레드(창)에서
+        # 직접 돌리면 그동안 창 전체가 멈춰 보인다. 스레드로 빼서 창은 계속 반응하게 한다.
         threading.Thread(target=self._render_live_apply, args=(cfg,), daemon=True).start()
 
     def _render_live_apply(self, cfg):
-        start_ts = main.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             cache = main.load_data_cache(self.cfg)
             now = main.datetime.now()
             path = main.render_wallpaper(cfg, now, cache.get("timetable", []), cache.get("meals", []))
             main.set_wallpaper(path)
-            text = "바탕화면 실시간 반영됨 ✓"
-            teacher_msg = self._read_teacher_status(start_ts, cfg.get("show_teacher_name", False))
-            if teacher_msg is not None and not teacher_msg.get("ok"):
-                text += f" — 선생님 이름 표시 실패: {teacher_msg.get('message')}"
-            self.after(0, lambda: self.status_var.set(text))
+            self.after(0, lambda: self.status_var.set("바탕화면 실시간 반영됨 ✓"))
         except Exception as e:
             print(f"[실시간 적용 실패] {e}")
 
@@ -656,7 +640,6 @@ class App(tk.Tk):
         new_cfg["bg_photo_mode"] = self.photo_mode.get()
         new_cfg["bg_photo_idx"] = self.preset_combo.current()
         new_cfg["custom_background"] = self.photo_path.get().strip() or None
-        new_cfg["show_teacher_name"] = self.show_teacher_var.get()
 
         new_cfg["font_colors"] = {k: v.get() for k, v in self.colors_vars.items()}
         
@@ -689,10 +672,9 @@ class App(tk.Tk):
 
         self.apply_btn.config(state="disabled")
         self.status_var.set("적용 중... (사진/시간표/급식을 가져오는 중)")
-        threading.Thread(target=self._run_engine, args=(self.show_teacher_var.get(),), daemon=True).start()
+        threading.Thread(target=self._run_engine, daemon=True).start()
 
-    def _run_engine(self, show_teacher):
-        start_ts = main.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def _run_engine(self):
         try:
             creationflags = 0
             if sys.platform == "win32":
@@ -708,35 +690,12 @@ class App(tk.Tk):
         except Exception as e:
             ok = False
             print(e)
-        teacher_msg = self._read_teacher_status(start_ts, show_teacher)
-        self.after(0, self._on_engine_done, ok, teacher_msg)
+        self.after(0, self._on_engine_done, ok)
 
-    def _read_teacher_status(self, start_ts, enabled):
-        """--windowed 빌드는 콘솔이 없어서 컴시간 조회 결과를 print()로는 볼 수 없다.
-        main.py가 남긴 상태 파일을, 이번 실행 이후에 쓰인 것만 골라 읽어온다.
-        (백그라운드 스레드에서 호출되므로 Tkinter 변수는 여기서 직접 읽지 않고
-        호출부가 메인 스레드에서 미리 읽어 전달한 값을 받는다.)"""
-        if not enabled:
-            return None
-        try:
-            with open(main.TEACHER_STATUS_PATH, "r", encoding="utf-8") as f:
-                status = json.load(f)
-            if status.get("at", "") >= start_ts:
-                return status
-        except Exception:
-            pass
-        return None
-
-    def _on_engine_done(self, ok, teacher_msg=None):
+    def _on_engine_done(self, ok):
         self.apply_btn.config(state="normal")
         if ok:
-            text = "바탕화면에 적용되었습니다 ✓"
-            if teacher_msg is not None:
-                if teacher_msg.get("ok"):
-                    text += " (선생님 이름 표시됨)"
-                else:
-                    text += f" — 선생님 이름 표시 실패: {teacher_msg.get('message')}"
-            self.status_var.set(text)
+            self.status_var.set("바탕화면에 적용되었습니다 ✓")
         else:
             self.status_var.set("적용 실패 — 설정을 다시 확인해주세요")
             messagebox.showerror("적용 실패", "바탕화면 적용 중 오류가 발생했습니다. 입력값을 확인해주세요.")
