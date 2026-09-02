@@ -6,9 +6,10 @@
 1. 처음 실행 시 학교 이름/학년/반을 입력받아 config.json에 저장 (이후 재실행 시 재사용)
 2. 실행될 때마다 NEIS Open API에서 오늘의 시간표/급식/학사일정을 가져와 바탕화면 이미지를
    새로 그리고 적용한 뒤 종료 (캐시로 건너뛰지 않고 매번 새로 조회함)
-3. 주기적인 자동 갱신은 ensure_autostart()가 스스로 등록하는 Windows 작업 스케줄러가
-   이 프로그램을 `--background` 인자로 15분마다 실행시키는 방식으로 처리한다 (배터리
-   전원이어도 멈추지 않도록, 절전에서 깨어나면 바로 따라잡도록 설정을 강제한다).
+3. 주기적인 자동 갱신은 ensure_autostart()가 스스로 등록하는 Windows 작업 스케줄러
+   작업 두 개가 처리한다: (a) 5분마다 도는 주기 작업, (b) 절전에서 깨어나는
+   순간(Power-Troubleshooter 이벤트 ID 1) 즉시 도는 작업. 배터리 전원이어도
+   멈추지 않도록, 놓친 실행은 바로 따라잡도록 설정을 강제한다.
    사용자가 수동으로 작업 스케줄러를 등록할 필요는 없다.
    `--reset` 인자로 실행하면 저장된 학교/반 설정을 지우고 다시 설정할 수 있음
 """
@@ -293,25 +294,42 @@ def ensure_autostart():
         winreg.SetValueEx(key, "SchoolWallpaperSync", 0, winreg.REG_SZ, exe_cmd)
         winreg.CloseKey(key)
         
-        # 2. 윈도우 작업 스케줄러(Task Scheduler)에 15분 주기 자동 갱신 등록
+        # 2. 윈도우 작업 스케줄러(Task Scheduler)에 5분 주기 자동 갱신 등록
         # (노트북이 계속 켜져 있거나 화면이 켜졌을 때 자정 지난 시간표/급식을 자동 갱신)
         if getattr(sys, "frozen", False):
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            task_cmd = f'schtasks /create /tn "SchoolWallpaperSync" /tr "\\"{exe_target}\\" --background" /sc MINUTE /mo 15 /f'
+            task_cmd = f'schtasks /create /tn "SchoolWallpaperSync" /tr "\\"{exe_target}\\" --background" /sc MINUTE /mo 5 /f'
             subprocess.run(task_cmd, shell=True, capture_output=True, creationflags=creationflags)
+
+            # 2-1. 절전 모드에서 깨어나는 "그 순간" 바로 반영되도록 별도 이벤트 트리거
+            # 등록. 주기 트리거의 StartWhenAvailable만으로는 "놓친 걸 곧" 실행하는
+            # 정도라 몇 분씩 늦어질 수 있어서, 아침에 노트북을 열자마자 최신 상태이길
+            # 원한다면 이게 핵심이다. Microsoft-Windows-Power-Troubleshooter의
+            # 이벤트 ID 1(절전에서 재개)을 그대로 트리거로 건다.
+            resume_query = (
+                "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] "
+                "and EventID=1]]"
+            )
+            resume_cmd = (
+                f'schtasks /create /tn "SchoolWallpaperSync_OnResume" '
+                f'/tr "\\"{exe_target}\\" --background" '
+                f'/sc ONEVENT /ec System /mo "{resume_query}" /f'
+            )
+            subprocess.run(resume_cmd, shell=True, capture_output=True, creationflags=creationflags)
 
             # schtasks /create의 기본값은 "배터리로 동작 중이면 시작하지 않음 /
             # 배터리로 전환되면 중단함" + "놓친 실행은 따라잡지 않음"이라, 노트북이
             # 충전 중이 아니거나 절전 후 깨어난 직후에는 자동 갱신이 조용히
             # 멈춰버린다. 매번 재등록될 때마다 PowerShell로 이 설정들을 꺼서
-            # 전원 상태와 무관하게 항상 15분마다 갱신되도록 강제한다.
+            # 전원 상태와 무관하게 항상 갱신되도록 강제한다. (두 작업 모두 적용)
             ps_cmd = (
-                "$t = Get-ScheduledTask -TaskName 'SchoolWallpaperSync' -ErrorAction SilentlyContinue; "
+                "foreach ($name in @('SchoolWallpaperSync', 'SchoolWallpaperSync_OnResume')) { "
+                "$t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; "
                 "if ($t) { "
                 "$t.Settings.DisallowStartIfOnBatteries = $false; "
                 "$t.Settings.StopIfGoingOnBatteries = $false; "
                 "$t.Settings.StartWhenAvailable = $true; "
-                "Set-ScheduledTask -InputObject $t | Out-Null }"
+                "Set-ScheduledTask -InputObject $t | Out-Null } }"
             )
             subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
