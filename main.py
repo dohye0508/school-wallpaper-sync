@@ -107,7 +107,7 @@ DEFAULT_COLORS = {
     "meals_type": "#FF968C",
     "meals_dish": "#FFFFFF",
     "date_weekday": "#CDC3FF",
-    "date_calendar": "#D2D5E0",
+    "date_calendar": "#EBECF1",
     "dday_label": "#FFD166",
     "dday_name": "#FFFFFF"
 }
@@ -149,7 +149,7 @@ DEFAULT_SECTIONS = {
     },
     "date_info": {
         "x": 50,
-        "y": 54,
+        "y": 49,
         "show": False,
         "stroke_width": 0,
         "shadow_blur": 5,

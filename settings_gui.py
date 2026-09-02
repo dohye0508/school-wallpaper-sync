@@ -64,7 +64,7 @@ class App(tk.Tk):
         self.title("학교 바탕화면 설정")
         self.resizable(False, False)
         # 창 크기 조정 (Y축 길이를 늘려 저장/초기화/닫기 버튼이 시원하게 보이도록 여백 확보)
-        self.geometry("590x756")
+        self.geometry("590x620")
         try:
             icon_path = os.path.join(main.ROOT_DIR, "icon.ico")
             if os.path.exists(icon_path):
@@ -97,10 +97,12 @@ class App(tk.Tk):
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
         tab_basic = ttk.Frame(notebook)
+        tab_colors = ttk.Frame(notebook)
         tab_design = ttk.Frame(notebook)
 
         notebook.add(tab_basic, text=" 기본 설정 ")
-        notebook.add(tab_design, text=" 배치 및 디자인 설정 ")
+        notebook.add(tab_colors, text=" 글자 색상 설정 ")
+        notebook.add(tab_design, text=" 배치 및 효과 설정 ")
 
         pad = {"padx": 15, "pady": 4}
 
@@ -165,9 +167,9 @@ class App(tk.Tk):
         self.update_bg_ui_state()
 
         # ----------------------------------------------------
-        # Tab 3: 배치 및 디자인 설정
+        # Tab 2: 글자 색상 설정
         # ----------------------------------------------------
-        color_frame = ttk.LabelFrame(tab_design, text=" 요소별 글자 색상 설정 ")
+        color_frame = ttk.LabelFrame(tab_colors, text=" 요소별 글자 색상 설정 ")
         color_frame.pack(fill="x", padx=15, pady=6)
         
         self.colors_vars = {}
@@ -223,7 +225,9 @@ class App(tk.Tk):
             val = colors_cfg.get(key, DEFAULT_COLORS.get(key, "#FFFFFF"))
             make_color_btn(color_frame, label, key, val, r, col)
 
-        # 섹션별 배치 및 효과 설정 영역
+        # ----------------------------------------------------
+        # Tab 3: 배치 및 효과 설정
+        # ----------------------------------------------------
         layout_frame = ttk.LabelFrame(tab_design, text=" 섹션 배치 및 개별 효과 설정 ")
         layout_frame.pack(fill="both", expand=True, padx=15, pady=6)
 
@@ -383,7 +387,7 @@ class App(tk.Tk):
         # update_idletasks()만으로는 Notebook처럼 크기 협상이 한 틱 늦게 끝나는
         # 위젯이 있어 완전히 반영되지 않는 경우가 있어 update()로 강제로 다 처리한다.
         self.update()
-        w, h = 590, 756
+        w, h = 590, 620
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         x, y = (sw - w) // 2, (sh - h) // 2
         # 내용물이 늘어나도 창 자체는 이 크기를 넘지 못하도록 위/아래 크기를 고정한다
