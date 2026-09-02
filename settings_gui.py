@@ -64,7 +64,7 @@ class App(tk.Tk):
         self.title("학교 바탕화면 설정")
         self.resizable(False, False)
         # 창 크기 조정 (Y축 길이를 늘려 저장/초기화/닫기 버튼이 시원하게 보이도록 여백 확보)
-        self.geometry("590x660")
+        self.geometry("590x693")
         try:
             icon_path = os.path.join(main.ROOT_DIR, "icon.ico")
             if os.path.exists(icon_path):
@@ -322,6 +322,14 @@ class App(tk.Tk):
             op_slider.set(vars_dict["shadow_opacity"].get())
             ttk.Label(sec_frame, textvariable=self.label_vars[sec_key]["shadow_opacity"]).grid(row=6, column=2, padx=5, sticky="w")
 
+            # 7. 학사일정만 표시 개수 지정 가능 (최대 5개, 기본 3개)
+            if sec_key == "dday":
+                ttk.Label(sec_frame, text="표시 개수 (최대 5)").grid(row=7, column=0, sticky="w", padx=10, pady=2)
+                self.dday_count_var = tk.IntVar(value=self.cfg.get("dday_count", 3))
+                count_spin = ttk.Spinbox(sec_frame, from_=1, to=5, textvariable=self.dday_count_var, width=5,
+                                          command=self.trigger_live_apply)
+                count_spin.grid(row=7, column=1, sticky="w", padx=10, pady=2)
+
         # ----------------------------------------------------
         # 공통 하단 영역
         # ----------------------------------------------------
@@ -345,7 +353,7 @@ class App(tk.Tk):
         # update_idletasks()만으로는 Notebook처럼 크기 협상이 한 틱 늦게 끝나는
         # 위젯이 있어 완전히 반영되지 않는 경우가 있어 update()로 강제로 다 처리한다.
         self.update()
-        w, h = 590, 660
+        w, h = 590, 693
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         x, y = (sw - w) // 2, (sh - h) // 2
         # 내용물이 늘어나도 창 자체는 이 크기를 넘지 못하도록 위/아래 크기를 고정한다
@@ -388,6 +396,9 @@ class App(tk.Tk):
         for s in ["school_info", "timetable", "meals", "date_info", "dday"]:
             self.sec_vars[s]["show"].trace_add("write", self.trigger_live_apply)
 
+        # 4. 학사일정 표시 개수 (스핀박스에 직접 숫자를 입력하는 경우까지 반영)
+        self.dday_count_var.trace_add("write", self.trigger_live_apply)
+
     def trigger_live_apply(self, *args):
         if getattr(self, "_initializing", False):
             return  # 창을 여는 중 위젯 초기값 세팅으로 인한 트리거는 무시
@@ -396,9 +407,17 @@ class App(tk.Tk):
         # 80ms 디바운스 적용으로 드래그 시 렉 줄임
         self.pending_apply = self.after(80, self.perform_live_apply)
 
+    def _safe_dday_count(self):
+        # 스핀박스에 직접 숫자를 지우고 타이핑하는 중처럼 값이 비어있거나
+        # 숫자가 아닐 때 IntVar.get()이 TclError를 던지는 걸 방지한다
+        try:
+            return max(1, min(5, int(self.dday_count_var.get())))
+        except (tk.TclError, ValueError):
+            return self.cfg.get("dday_count", 3)
+
     def perform_live_apply(self):
         self.pending_apply = None
-        
+
         # 임시 설정 객체 취합
         font_colors = {k: v.get() for k, v in self.colors_vars.items()}
         
@@ -421,6 +440,7 @@ class App(tk.Tk):
             "bg_photo_mode": self.photo_mode.get(),
             "bg_photo_idx": self.preset_combo.current(),
             "custom_background": self.photo_path.get().strip() or None,
+            "dday_count": self._safe_dday_count(),
             "font_colors": font_colors,
             "sections": sections_data
         }
@@ -520,7 +540,9 @@ class App(tk.Tk):
                     self.sec_vars[s][key].set(val)
                 if key in self.label_vars[s]:
                     self.label_vars[s][key].set(str(val))
-                    
+
+        self.dday_count_var.set(3)
+
         self.status_var.set("기본 설정으로 초기화되었습니다 ✓")
         # 즉시 바탕화면에 변경 사항 반영
         self.trigger_live_apply()
@@ -644,6 +666,7 @@ class App(tk.Tk):
         new_cfg["bg_photo_mode"] = self.photo_mode.get()
         new_cfg["bg_photo_idx"] = self.preset_combo.current()
         new_cfg["custom_background"] = self.photo_path.get().strip() or None
+        new_cfg["dday_count"] = self._safe_dday_count()
 
         new_cfg["font_colors"] = {k: v.get() for k, v in self.colors_vars.items()}
         

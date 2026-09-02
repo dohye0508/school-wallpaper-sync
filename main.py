@@ -157,7 +157,7 @@ DEFAULT_SECTIONS = {
         "font_size": 157
     },
     "dday": {
-        "x": 90,
+        "x": 98,
         "y": 90,
         "show": True,
         "stroke_width": 0,
@@ -180,6 +180,7 @@ DEFAULT_CONFIG = {
     "custom_background": None,
     "bg_photo_mode": "auto",
     "bg_photo_idx": 0,
+    "dday_count": 3,
     "font_colors": DEFAULT_COLORS,
     "text_effects": DEFAULT_TEXT_EFFECTS,
     "sections": DEFAULT_SECTIONS
@@ -489,7 +490,7 @@ GRADE_EVENT_FLAG = {
 SCHEDULE_EXCLUDE_NAMES = {"토요휴업일", "일요휴업일"}
 
 
-def fetch_school_schedule(cfg, today, limit=3):
+def fetch_school_schedule(cfg, today, limit=5):
     """오늘 이후 가까운 학사일정(시험, 방학, 공휴일 등)을 최대 limit개, D-day와 함께
     가까운 순으로 반환한다. NEIS SchoolSchedule API 사용. 등록된 일정이 없으면 빈 리스트."""
     ymd = today.strftime("%Y%m%d")
@@ -843,7 +844,8 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
         ddy = int(H * s_dday.get("y", 90) / 100)
         inner_gap = int(14 * dday_scale)   # "D-22" <-> "추석" 사이
         event_gap = int(30 * dday_scale)   # 서로 다른 일정끼리의 간격
-        events = dday_events[:3]
+        dday_count = max(1, min(5, int(cfg.get("dday_count", 3))))
+        events = dday_events[:dday_count]
         parts = []
         for i, ev in enumerate(events):
             dday_n = ev.get("dday", 0)
