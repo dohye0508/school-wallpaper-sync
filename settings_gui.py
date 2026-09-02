@@ -64,7 +64,7 @@ class App(tk.Tk):
         self.title("학교 바탕화면 설정")
         self.resizable(False, False)
         # 창 크기 조정 (Y축 길이를 늘려 저장/초기화/닫기 버튼이 시원하게 보이도록 여백 확보)
-        self.geometry("590x720")
+        self.geometry("590x756")
         try:
             icon_path = os.path.join(main.ROOT_DIR, "icon.ico")
             if os.path.exists(icon_path):
@@ -383,7 +383,7 @@ class App(tk.Tk):
         # update_idletasks()만으로는 Notebook처럼 크기 협상이 한 틱 늦게 끝나는
         # 위젯이 있어 완전히 반영되지 않는 경우가 있어 update()로 강제로 다 처리한다.
         self.update()
-        w, h = 590, 720
+        w, h = 590, 756
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         x, y = (sw - w) // 2, (sh - h) // 2
         # 내용물이 늘어나도 창 자체는 이 크기를 넘지 못하도록 위/아래 크기를 고정한다

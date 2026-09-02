@@ -840,14 +840,18 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
 
     # ---- 5. 학사일정 D-Day 섹션 (NEIS 자동 조회 + 수동 입력을 합쳐 가까운 순으로 정렬,
     #         최대 dday_count개, 한 줄에 오른쪽 정렬) ----
-    dday_events = list(schedule) if isinstance(schedule, list) else ([schedule] if schedule else [])
+    # 수동으로 추가한 일정은 사용자가 일부러 채워 넣은 것(주로 NEIS에 없는 시험)이므로,
+    # 표시 개수 제한 안에서 더 가까운 자동 조회 일정에 밀려 안 보이는 일이 없도록
+    # 항상 우선 확보하고, 남는 자리만 자동 조회 일정으로 채운다.
+    auto_events = list(schedule) if isinstance(schedule, list) else ([schedule] if schedule else [])
+    manual_events = []
     for m in cfg.get("manual_dday", []) or []:
         try:
             m_date = datetime.strptime(m["date"], "%Y%m%d").date()
             dday_n = (m_date - now.date()).days
             if dday_n < 0:
                 continue  # 이미 지난 수동 일정은 표시하지 않는다
-            dday_events.append({
+            manual_events.append({
                 "name": m.get("name", ""),
                 "date": m["date"],
                 "dday": dday_n,
@@ -855,6 +859,13 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
             })
         except Exception:
             continue
+    manual_events.sort(key=lambda e: e["dday"])
+
+    dday_count = max(1, min(10, int(cfg.get("dday_count", 3))))
+    if len(manual_events) >= dday_count:
+        dday_events = manual_events[:dday_count]
+    else:
+        dday_events = manual_events + auto_events[:dday_count - len(manual_events)]
     dday_events.sort(key=lambda e: e.get("dday", 9999))
 
     if s_dday.get("show", True) and dday_events:
@@ -862,7 +873,6 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
         ddy = int(H * s_dday.get("y", 90) / 100)
         inner_gap = int(14 * dday_scale)   # "D-22" <-> "추석" 사이
         event_gap = int(30 * dday_scale)   # 서로 다른 일정끼리의 간격
-        dday_count = max(1, min(10, int(cfg.get("dday_count", 3))))
         events = dday_events[:dday_count]
         parts = []
         for i, ev in enumerate(events):
