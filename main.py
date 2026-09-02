@@ -131,7 +131,7 @@ DEFAULT_SECTIONS = {
     },
     "timetable": {
         "x": 50,
-        "y": 19,
+        "y": 15,
         "show": True,
         "stroke_width": 0,
         "shadow_blur": 5,
@@ -157,8 +157,8 @@ DEFAULT_SECTIONS = {
         "font_size": 157
     },
     "dday": {
-        "x": 50,
-        "y": 14,
+        "x": 90,
+        "y": 90,
         "show": True,
         "stroke_width": 0,
         "shadow_blur": 5,
@@ -687,8 +687,13 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
         w2, _ = text_size(sdraw, part2, font2)
         total = w1 + gap + w2
         x_start = x - total / 2
-        draw_text_with_effects(part1, x_start, y, font1, color1, section_cfg, align="left")
-        draw_text_with_effects(part2, x_start + w1 + gap, y, font2, color2, section_cfg, align="left")
+        # 두 폰트 크기가 다르면 위쪽 기준으로 그릴 때 글자가 어긋나 보이므로
+        # ascent(글자 위쪽 여백) 차이만큼 보정해서 베이스라인을 맞춘다
+        ascent1 = font1.getmetrics()[0]
+        ascent2 = font2.getmetrics()[0]
+        max_ascent = max(ascent1, ascent2)
+        draw_text_with_effects(part1, x_start, y + (max_ascent - ascent1), font1, color1, section_cfg, align="left")
+        draw_text_with_effects(part2, x_start + w1 + gap, y + (max_ascent - ascent2), font2, color2, section_cfg, align="left")
 
     # 개선된 폰트 크기 및 두께 정의 (KoPubWorld 폰트 최적화 + 개별 font_size 배율 반영)
     s_info = sections.get("school_info", DEFAULT_SECTIONS["school_info"])
