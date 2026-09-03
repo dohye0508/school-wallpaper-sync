@@ -238,6 +238,27 @@ def save_data_cache(timetable, meals, ymd=None, cfg=None, schedule=None):
     with open(DATA_CACHE_PATH, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
+def read_today_cache_if_matching(cfg, ymd):
+    """네트워크 호출 없이, 오늘 날짜 + 같은 학교/학년/반의 캐시가 있으면 그대로 읽어온다.
+    와이파이가 잠깐 끊겨 NEIS 조회가 실패했을 때, 방금 전까지 정상이던 화면을
+    '시간표 없음' 같은 빈 화면으로 덮어쓰지 않고 마지막으로 성공한 값을 유지하기 위함."""
+    if not os.path.exists(DATA_CACHE_PATH):
+        return None
+    try:
+        with open(DATA_CACHE_PATH, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        return None
+    same_school = (
+        cache.get("school_code") == cfg.get("school_code")
+        and cache.get("grade") == cfg.get("grade")
+        and cache.get("classnm") == cfg.get("classnm")
+    )
+    if cache.get("date") == ymd and same_school:
+        return cache
+    return None
+
+
 def load_data_cache(cfg=None):
     today = datetime.now().strftime("%Y%m%d")
     if os.path.exists(DATA_CACHE_PATH):
@@ -258,12 +279,13 @@ def load_data_cache(cfg=None):
             pass
 
     # 오늘 날짜가 아니거나, 학교가 바뀌었거나, 캐시가 없는데 cfg가 주어졌다면
-    # 실시간으로 오늘 데이터 조회 후 캐싱
+    # 실시간으로 오늘 데이터 조회 후 캐싱 (fetch_*가 None을 반환하면 네트워크/API
+    # 실패라는 뜻이므로 빈 값으로 덮어쓰지 않고 []로만 안전하게 처리한다)
     if cfg and cfg.get("school_code"):
         try:
-            timetable = fetch_timetable(cfg, today)
-            meals = fetch_meal(cfg, today)
-            schedule = fetch_school_schedule(cfg, datetime.now())
+            timetable = fetch_timetable(cfg, today) or []
+            meals = fetch_meal(cfg, today) or []
+            schedule = fetch_school_schedule(cfg, datetime.now()) or []
             save_data_cache(timetable, meals, today, cfg, schedule)
             return {"date": today, "timetable": timetable, "meals": meals, "schedule": schedule,
                     "school_code": cfg.get("school_code"), "grade": cfg.get("grade"), "classnm": cfg.get("classnm")}
@@ -495,7 +517,7 @@ def fetch_meal(cfg, ymd):
         return meals
     except Exception as e:
         print(f"[급식 조회 실패] {e}")
-        return []
+        return None  # 네트워크/API 실패와 "정상 응답이지만 급식이 없음"을 구분한다
 
 
 def fetch_timetable(cfg, ymd):
@@ -520,7 +542,7 @@ def fetch_timetable(cfg, ymd):
         return [{"period": r["PERIO"], "subject": r["ITRT_CNTNT"]} for r in rows]
     except Exception as e:
         print(f"[시간표 조회 실패] {e}")
-        return []
+        return None  # 네트워크/API 실패와 "정상 응답이지만 시간표가 없음"을 구분한다
 
 
 GRADE_EVENT_FLAG = {
@@ -553,7 +575,7 @@ def fetch_school_schedule(cfg, today, limit=10):
         rows = data["SchoolSchedule"][1]["row"]
     except Exception as e:
         print(f"[학사일정 조회 실패] {e}")
-        return []
+        return None  # 네트워크/API 실패와 "정상 응답이지만 일정이 없음"을 구분한다
 
     grade_flag = GRADE_EVENT_FLAG.get(str(cfg.get("grade")))
     candidates = [
@@ -990,6 +1012,22 @@ def update_once(cfg):
     meals = fetch_meal(cfg, ymd)
     timetable = fetch_timetable(cfg, ymd)
     schedule = fetch_school_schedule(cfg, now)
+
+    # fetch_*가 None이면 "정상 응답인데 데이터가 없음"이 아니라 와이파이가 잠깐
+    # 끊기는 등 네트워크/API 호출 자체가 실패했다는 뜻이다. 이때 그대로 빈 리스트로
+    # 렌더링하면 방금 전까지 잘 뜨던 시간표/급식이 "시간표 없음"/"급식 없음"으로
+    # 덮어써진다. 오늘 자로 이미 성공해둔 캐시가 있으면 실패한 항목만 그걸로
+    # 대체해서, 일시적인 네트워크 장애가 화면에 그대로 반영되지 않도록 한다.
+    if meals is None or timetable is None or schedule is None:
+        cached = read_today_cache_if_matching(cfg, ymd)
+        if meals is None:
+            meals = (cached.get("meals") if cached else None) or []
+        if timetable is None:
+            timetable = (cached.get("timetable") if cached else None) or []
+        if schedule is None:
+            schedule = (cached.get("schedule") if cached else None) or []
+        print("[일부 조회 실패 - 오늘자 캐시로 대체했습니다]")
+
     save_data_cache(timetable, meals, ymd, cfg, schedule) # 로컬 캐시 갱신
     path = render_wallpaper(cfg, now, timetable, meals, schedule)
     set_wallpaper(path)

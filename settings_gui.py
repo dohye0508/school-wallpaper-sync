@@ -557,7 +557,7 @@ class App(tk.Tk):
         try:
             cache = main.load_data_cache(self.cfg)
             now = main.datetime.now()
-            path = main.render_wallpaper(cfg, now, cache.get("timetable", []), cache.get("meals", []), cache.get("schedule"))
+            path = main.render_wallpaper(cfg, now, cache.get("timetable") or [], cache.get("meals") or [], cache.get("schedule"))
             main.set_wallpaper(path)
             self.after(0, lambda: self.status_var.set("바탕화면 실시간 반영됨 ✓"))
         except Exception as e:
@@ -586,6 +586,19 @@ class App(tk.Tk):
                 timetable = main.fetch_timetable(cfg, today)
                 meals = main.fetch_meal(cfg, today)
                 schedule = main.fetch_school_schedule(cfg, main.datetime.now())
+
+                # None은 "네이스에 데이터 없음"이 아니라 네트워크/API 호출 자체가
+                # 실패했다는 뜻이다. 와이파이가 잠깐 끊긴 것뿐인데 방금까지 잘 뜨던
+                # 화면을 빈 값으로 덮어쓰지 않도록, 오늘자 캐시가 있으면 그걸로 대체한다.
+                if timetable is None or meals is None or schedule is None:
+                    fallback = main.read_today_cache_if_matching(cfg, today)
+                    if timetable is None:
+                        timetable = (fallback.get("timetable") if fallback else None) or []
+                    if meals is None:
+                        meals = (fallback.get("meals") if fallback else None) or []
+                    if schedule is None:
+                        schedule = (fallback.get("schedule") if fallback else None) or []
+
                 main.save_data_cache(timetable, meals, today, cfg, schedule)
 
                 # 렌더링 직전에 다시 한번 최신 설정을 읽어, 그 사이 사용자가 저장한 변경사항을 존중한다
