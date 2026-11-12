@@ -64,10 +64,16 @@ def fetch_meal(cfg, ymd):
         rows = data["mealServiceDietInfo"][1]["row"]
         meals = []
         for r in rows:
-            dishes = r["DDISH_NM"].replace("<br/>", "\n")
+            raw_dishes = re.sub(r'<br\s*/?>', '\n', r['DDISH_NM'], flags=re.IGNORECASE)
             # 알레르기 표시 괄호 제거 (예: "김치찌개 (5.6.9)")
-            dishes = re.sub(r"\s*\([0-9.]+\)", "", dishes)
-            meals.append({"name": r["MMEAL_SC_NM"], "dishes": dishes})
+            dishes = re.sub(r"\s*\([0-9.]+\)", "", raw_dishes)
+            meals.append({
+                'name': r['MMEAL_SC_NM'], 'dishes': dishes,
+                'raw_dishes': raw_dishes,
+                'calories': r.get('CAL_INFO') or '',
+                'nutrition': re.sub(r'<br\s*/?>', '\n', r.get('NTR_INFO') or '', flags=re.IGNORECASE),
+                'origin': re.sub(r'<br\s*/?>', '\n', r.get('ORPLC_INFO') or '', flags=re.IGNORECASE),
+            })
         return meals
     except Exception as e:
         log_failure('급식 조회 실패', e, cfg)

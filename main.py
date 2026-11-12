@@ -19,6 +19,7 @@ from copy import deepcopy
 from core.neis import neis_get, search_school, fetch_meal, fetch_timetable, fetch_school_schedule
 from core.storage import atomic_json, desktop_transaction
 from core.sync import identity, resolve_data
+from core.schoolday import target_day, apply_overrides
 
 import ctypes
 import json
@@ -26,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -188,6 +190,8 @@ DEFAULT_CONFIG = {
     "school_kind": "",
     "grade": "",
     "classnm": "",
+    "display_day": "today",
+    "manual_timetable": [],
     "custom_background": None,
     "bg_photo_mode": "auto",
     "bg_photo_idx": 0,
@@ -267,8 +271,8 @@ def read_today_cache_if_matching(cfg, ymd):
 
 def load_data_cache(cfg=None):
     """Read only: preview must never fetch or overwrite the shared cache."""
-    today = datetime.now().strftime("%Y%m%d")
     cfg = cfg or load_config() or {}
+    today = target_day(cfg, datetime.now()).strftime("%Y%m%d")
     return read_today_cache_if_matching(cfg, today) or {
         "date": today, "timetable": [], "meals": [], "schedule": []}
 
@@ -496,10 +500,17 @@ def spaced(text):
     return " ".join(list(text))
 
 
-def render_wallpaper(cfg, now, timetable, meals, schedule=None, size=None):
-    W, H = size or get_screen_size()
+def compose_wallpaper(cfg, now, timetable, meals, schedule=None, size=None, background=None):
+    """Return an image without writing wallpaper/config or applying OS settings.
 
-    bg = fetch_background(cfg, now, W, H)
+    Explicit size and background avoid desktop/network access entirely. With no
+    background supplied, the existing background loader/cache is used.
+    """
+    W, H = size or get_screen_size()
+    display_date = target_day(cfg, now)
+    timetable = apply_overrides(timetable, cfg, display_date.strftime('%Y%m%d'))
+
+    bg = fetch_background(cfg, now, W, H) if background is None else fit_cover(background, W, H)
     canvas = bg.convert("RGBA")
     shadow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     sdraw = ImageDraw.Draw(shadow_layer)
@@ -600,6 +611,13 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None, size=None):
     tt_row_gap = int(H * 0.035 * tt_scale)
     meal_line_gap = int(H * 0.026 * meals_scale)
 
+    # Always identify the data day, even in a minimal theme with date_info hidden.
+    day_name = '내일' if cfg.get('display_day') == 'tomorrow' else '오늘'
+    day_label = f"{day_name} · {display_date:%Y.%m.%d} ({WEEKDAY_KR[display_date.weekday()]})"
+    draw_text_with_effects(day_label, int(W * 0.025), int(H * 0.02),
+                          font(FONT_MEDIUM, max(12, int(H * 0.016))),
+                          colors['date_calendar'], s_info, align='left')
+
     # ---- 1. 학교 헤더 섹션 ----
     if s_info.get("show", True):
         sx = int(W * s_info.get("x", 50) / 100)
@@ -664,8 +682,8 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None, size=None):
     if s_date.get("show", True):
         dx = int(W * s_date.get("x", 50) / 100)
         dy = int(H * s_date.get("y", 88) / 100)
-        weekday_str = WEEKDAY_EN[now.weekday()].upper()
-        date_str = now.strftime("%Y-%m-%d")
+        weekday_str = WEEKDAY_EN[display_date.weekday()].upper()
+        date_str = display_date.strftime("%Y-%m-%d")
         draw_two_tone_with_effects(weekday_str, date_weekday_font, colors["date_weekday"],
                                    date_str, date_calendar_font, colors["date_calendar"],
                                    dx, dy, s_date, gap=int(16 * date_scale))
@@ -675,7 +693,14 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None, size=None):
     # 수동으로 추가한 일정은 사용자가 일부러 채워 넣은 것(주로 NEIS에 없는 시험)이므로,
     # 표시 개수 제한 안에서 더 가까운 자동 조회 일정에 밀려 안 보이는 일이 없도록
     # 항상 우선 확보하고, 남는 자리만 자동 조회 일정으로 채운다.
-    auto_events = list(schedule) if isinstance(schedule, list) else ([schedule] if schedule else [])
+    auto_events = deepcopy(schedule) if isinstance(schedule, list) else ([deepcopy(schedule)] if schedule else [])
+    for event in auto_events:
+        if isinstance(event, dict) and event.get('date'):
+            try:
+                event['dday'] = (datetime.strptime(event['date'], '%Y%m%d').date() - now.date()).days
+            except (ValueError, TypeError):
+                pass
+    auto_events = [event for event in auto_events if isinstance(event, dict) and event.get('dday', 0) >= 0]
     manual_events = []
     for m in cfg.get("manual_dday", []) or []:
         try:
@@ -732,7 +757,12 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None, size=None):
     for xy, text, fnt, fill, stroke_w, stroke_c in text_ops:
         draw.text(xy, text, font=fnt, fill=fill, stroke_width=stroke_w, stroke_fill=stroke_c)
 
-    img = canvas.convert("RGB")
+    return canvas.convert("RGB")
+
+
+def render_wallpaper(cfg, now, timetable, meals, schedule=None, size=None):
+    """Compatibility wrapper for the scheduled/background wallpaper engine."""
+    img = compose_wallpaper(cfg, now, timetable, meals, schedule, size=size)
     img.save(WALLPAPER_PATH, "PNG")
     return WALLPAPER_PATH
 
@@ -741,24 +771,149 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None, size=None):
 # 메인 루프
 # ---------------------------------------------------------------------------
 
+def apply_configuration(cfg):
+    """Apply an explicit editor snapshot and return states/maintenance warnings.
+
+    Rendering or OS-apply failure raises and preserves the saved configuration.
+    Network work cannot overwrite configuration saved by another process while
+    a request was in flight. No nested desktop transaction is acquired.
+    """
+    cfg = merge_defaults(deepcopy(cfg))
+    if not all(cfg.get(key) for key in ('school_code', 'edu_code', 'grade', 'classnm')):
+        raise ValueError('학교·학년·반을 먼저 설정하세요.')
+
+    def config_bytes():
+        try:
+            return Path(CONFIG_PATH).read_bytes()
+        except FileNotFoundError:
+            return None
+
+    def restore_bytes(path, previous):
+        if previous is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        fd, rollback = tempfile.mkstemp(prefix='apply-rollback-', suffix='.tmp', dir=BASE_DIR)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(previous)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(rollback, path)
+        finally:
+            if os.path.exists(rollback):
+                os.unlink(rollback)
+
+    original = config_bytes()
+    now = datetime.now()
+    ymd = target_day(cfg, now).strftime('%Y%m%d')
+    cached = read_today_cache_if_matching(cfg, ymd)
+    unfetched = dict.fromkeys(('timetable', 'meals', 'schedule'))
+    if any(state != 'unavailable' for state in resolve_data(unfetched, cached)['states'].values()):
+        fetched = unfetched
+    else:
+        fetched = {'timetable': fetch_timetable(cfg, ymd),
+                   'meals': fetch_meal(cfg, ymd),
+                   'schedule': fetch_school_schedule(cfg, now)}
+    warnings = []
+    with desktop_transaction(BASE_DIR):
+        if config_bytes() != original:
+            raise RuntimeError('다른 실행에서 설정이 변경되었습니다. 변경 취소 후 다시 적용하세요.')
+        if target_day(cfg, datetime.now()).strftime('%Y%m%d') != ymd:
+            raise RuntimeError('날짜가 변경되었습니다. 다시 적용하세요.')
+        cached = read_today_cache_if_matching(cfg, ymd)
+        data = resolve_data(fetched, cached)
+        if all(state == 'unavailable' for state in data['states'].values()):
+            if not apply_overrides([], cfg, ymd):
+                raise RuntimeError('데이터 조회 실패: 저장 설정과 기존 배경화면을 유지합니다.')
+            warnings.append('원격 데이터 조회에 실패하여 선택한 날짜의 수동 시간표를 사용했습니다.')
+        image = compose_wallpaper(cfg, now, data['timetable'], data['meals'], data['schedule'])
+        descriptor, candidate = tempfile.mkstemp(prefix='preview-apply-', suffix='.png', dir=BASE_DIR)
+        os.close(descriptor)
+        try:
+            image.save(candidate, 'PNG')
+            previous_image = Path(WALLPAPER_PATH).read_bytes() if os.path.exists(WALLPAPER_PATH) else None
+            atomic_json(CONFIG_PATH, cfg)
+            image_replaced = False
+            try:
+                os.replace(candidate, WALLPAPER_PATH)
+                image_replaced = True
+                set_wallpaper(WALLPAPER_PATH)
+            except Exception:
+                restore_bytes(CONFIG_PATH, original)
+                if image_replaced:
+                    restore_bytes(WALLPAPER_PATH, previous_image)
+                raise
+            # Post-apply maintenance failures must not pretend Apply failed.
+            try:
+                save_data_cache(data['timetable'], data['meals'], ymd, cfg,
+                                data['schedule'], data['states'])
+            except OSError as error:
+                warnings.append(f'캐시 저장 실패: {error}')
+        finally:
+            image.close()
+            if os.path.exists(candidate):
+                os.unlink(candidate)
+    autostart_error = None
+    try:
+        ensure_autostart()
+    except Exception as error:
+        autostart_error = str(error)
+        warnings.append(f'자동 갱신 등록 실패: {error}')
+    return {'states': data['states'], 'autostart_error': autostart_error, 'warnings': warnings}
+
+
+def refresh_data(cfg):
+    """Fetch the selected day's data without saving config or applying wallpaper.
+
+    Draft school data may be returned to its caller, but it is cached only if
+    the saved school identity and selected date still match. Rendering/selection is the GUI's
+    responsibility; this function never mutates its configuration argument.
+    """
+    cfg = deepcopy(cfg)
+    if not all(cfg.get(key) for key in ('school_code', 'edu_code', 'grade', 'classnm')):
+        raise ValueError('학교·학년·반을 먼저 설정하세요.')
+    now = datetime.now()
+    ymd = target_day(cfg, now).strftime('%Y%m%d')
+    fetched = {'timetable': fetch_timetable(cfg, ymd), 'meals': fetch_meal(cfg, ymd),
+               'schedule': fetch_school_schedule(cfg, now)}
+    with desktop_transaction(BASE_DIR):
+        recorded_at = datetime.now()
+        if target_day(cfg, recorded_at).strftime('%Y%m%d') != ymd:
+            raise RuntimeError('날짜가 변경되었습니다. 다시 새로고침하세요.')
+        data = resolve_data(fetched, read_today_cache_if_matching(cfg, ymd))
+        if all(state == 'unavailable' for state in data['states'].values()):
+            raise RuntimeError('데이터 조회 실패: 기존 캐시를 유지합니다.')
+        current = load_config()
+        if (current is not None and identity(current) == identity(cfg)
+                and target_day(current, recorded_at).strftime('%Y%m%d') == ymd):
+            save_data_cache(data['timetable'], data['meals'], ymd, cfg, data['schedule'], data['states'])
+        return {'date': ymd, **data, 'updated_at': recorded_at.strftime('%Y-%m-%d %H:%M:%S'),
+                **{key: cfg.get(key) for key in ('edu_code', 'school_code', 'school_kind', 'grade', 'classnm')}}
+
+
 def update_once(cfg):
     """Fetch a snapshot, then validate identity before committing any side effects."""
     cfg = deepcopy(cfg)
     now = datetime.now()
-    ymd = now.strftime("%Y%m%d")
+    ymd = target_day(cfg, now).strftime("%Y%m%d")
     fetched = {"meals": fetch_meal(cfg, ymd),
                "timetable": fetch_timetable(cfg, ymd),
                "schedule": fetch_school_schedule(cfg, now)}
     with desktop_transaction(BASE_DIR):
         latest = load_config() or cfg
-        if identity(latest) != identity(cfg) or datetime.now().strftime("%Y%m%d") != ymd:
+        commit_now = datetime.now()
+        if (identity(latest) != identity(cfg) or now.date() != commit_now.date()
+                or target_day(latest, commit_now).strftime("%Y%m%d") != ymd):
             return False  # school/date changed while fetching; discard old data
         cached = read_today_cache_if_matching(cfg, ymd)
         data = resolve_data(fetched, cached)
         if all(state == 'unavailable' for state in data['states'].values()):
-            raise RuntimeError("데이터 조회 실패: 기존 배경화면을 유지합니다.")
+            if not apply_overrides([], latest, ymd):
+                raise RuntimeError("데이터 조회 실패: 기존 배경화면을 유지합니다.")
+            print(f"[{ymd}] 원격 데이터 조회 실패: 선택한 날짜의 수동 시간표를 사용합니다.")
         save_data_cache(data['timetable'], data['meals'], ymd, cfg, data['schedule'], data['states'])
-        path = render_wallpaper(latest, now, data['timetable'], data['meals'], data['schedule'])
+        path = render_wallpaper(latest, commit_now, data['timetable'], data['meals'], data['schedule'])
         set_wallpaper(path)
     ensure_autostart()
     print(f"[{ymd}] 갱신 결과: {data['states']}")

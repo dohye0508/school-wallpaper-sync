@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-학교 바탕화면 설정용 소형 GUI.
-학교/반/배경 사진을 편하게 설정하고 "저장 및 지금 적용"으로 바로 반영한다.
-실제 시간표/급식 갱신 엔진(main.py 기반 SchoolWallpaper.exe)은 건드리지 않고,
-그 엔진이 읽는 dist/SchoolWallpaper/config.json 을 대신 편집해준다.
+학교 바탕화면 v1.4 편집기.
+편집과 테마 선택은 창 안 미리보기에만 반영하고 명시적으로 적용한다.
 """
 
 import json
@@ -11,12 +9,18 @@ import os
 import subprocess
 import sys
 import threading
+import queue
+from PIL import Image, ImageTk, ImageDraw
+from editor_tools import EditorTools
+from core.editor_state import EditHistory, describe_cache
+from core.schoolday import target_day, validate_overrides
+from core.themes import ThemeStore, apply_style, extract_style
 from copy import deepcopy
 from core.latest import LatestWorker
 from core.sync import identity
 from core.storage import desktop_transaction
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, colorchooser
+from tkinter import filedialog, messagebox, ttk, colorchooser, simpledialog
 
 import requests
 import main
@@ -50,7 +54,7 @@ def search_school(name):
     return main.search_school(cfg.get("api_key", main.API_KEY), name)
 
 
-class App(tk.Tk):
+class App(EditorTools, tk.Tk):
     def __init__(self):
         super().__init__()
         # 위젯을 다 만들기 전에는 창을 화면에 보여주지 않는다. (슬라이더/색상 버튼
@@ -58,10 +62,10 @@ class App(tk.Tk):
         # 창을 먼저 크게 띄웠다가 첫 클릭(리드로우) 시점에야 지정한 크기로 줄어드는
         # 현상이 있었다 — 완성된 뒤에 크기를 다시 맞추고 그때 보여주면 이 깜빡임이 없다)
         self.withdraw()
-        self.title("학교 바탕화면 설정")
-        self.resizable(False, False)
+        self.title("학교 바탕화면 설정 · v1.4")
+        self.resizable(True, True)
         # 창 크기 조정 (Y축 길이를 늘려 저장/초기화/닫기 버튼이 시원하게 보이도록 여백 확보)
-        self.geometry("590x620")
+        self.geometry("1200x760")
         try:
             icon_path = os.path.join(main.ROOT_DIR, "icon.ico")
             if os.path.exists(icon_path):
@@ -78,6 +82,22 @@ class App(tk.Tk):
         self.cfg = load_config()
         if not self.cfg:
             self.cfg = main.merge_defaults({})
+        self.cfg = deepcopy(self.cfg)
+        self._draft_base = deepcopy(self.cfg)
+        self._refreshing = False
+        self._searching = False
+        self._session_cache = None
+        self.manual_timetable = deepcopy(self.cfg.get('manual_timetable', []))
+        self._manual_identity = identity(self.cfg)
+        self._closing = False
+        self._applying = False
+        self._preview_revision = 0
+        self._preview_image = None
+        self._ui_events = queue.Queue()
+        self._poll_id = None
+        self._display_after = None
+        self.screen_size = main.get_screen_size()
+        self.theme_store = ThemeStore(os.path.join(main.BASE_DIR, "themes.json"), main.merge_defaults({}))
         self.search_results = []
         self.selected_school = None
         self.pending_apply = None
@@ -87,8 +107,58 @@ class App(tk.Tk):
         self._initializing = True
 
         # 탭 레이아웃 구성
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill="x", padx=15, pady=(12, 4))
+        ttk.Label(toolbar, text="테마", font=("맑은 고딕", 11, "bold")).pack(side="left")
+        self.theme_combo = ttk.Combobox(toolbar, state="readonly", width=26)
+        self.theme_combo.pack(side="left", padx=8)
+        self.theme_combo.bind("<<ComboboxSelected>>", self.on_theme_selected)
+        self.save_theme_btn = ttk.Button(toolbar, text="현재 디자인 저장", command=self.on_save_theme)
+        self.save_theme_btn.pack(side="left")
+        ttk.Label(toolbar, text="선택·편집은 미리보기에만 반영됩니다.").pack(side="left", padx=12)
+        utility = ttk.Frame(self)
+        utility.pack(fill='x', padx=15, pady=4)
+        self.day_var = tk.StringVar(value=self.cfg.get('display_day', 'today'))
+        for title, value in (('오늘', 'today'), ('내일', 'tomorrow')):
+            ttk.Radiobutton(utility, text=title, value=value, variable=self.day_var).pack(side='left', padx=3)
+        self.refresh_btn = ttk.Button(utility, text='데이터 새로고침 (F5)', command=self.on_refresh_data)
+        self.refresh_btn.pack(side='left', padx=6)
+        ttk.Button(utility, text='급식 상세', command=self.on_meal_details).pack(side='left', padx=3)
+        ttk.Button(utility, text='수동 시간표', command=self.on_manual_timetable).pack(side='left', padx=3)
+        self.dirty_var = tk.StringVar(value='저장된 설정')
+        ttk.Label(utility, textvariable=self.dirty_var, foreground='#956000').pack(side='right')
+        self.body = ttk.Frame(self)
+        self.body.pack(fill="both", expand=True, padx=10, pady=8)
+        editor = ttk.Frame(self.body, width=580)
+        editor.pack(side="left", fill="both")
+        editor.pack_propagate(False)
+        self.preview_area = ttk.LabelFrame(self.body, text=" 적용 전 미리보기 ")
+        self.preview_area.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        self.preview_note = ttk.Label(self.preview_area, text="오늘 저장된 데이터로 미리봅니다. 적용할 때 필요한 데이터를 가져옵니다.", wraplength=470)
+        self.preview_note.pack(fill="x", padx=12, pady=10)
+        controls = ttk.Frame(self.preview_area)
+        controls.pack(fill='x', padx=10)
+        self.zoom_var = tk.StringVar(value='화면에 맞춤')
+        self.grid_var = tk.BooleanVar(value=False)
+        self.compare_var = tk.BooleanVar(value=False)
+        ttk.Combobox(controls, textvariable=self.zoom_var, values=['화면에 맞춤', '100%', '150%'],
+                     state='readonly', width=12).pack(side='left')
+        ttk.Checkbutton(controls, text='격자', variable=self.grid_var).pack(side='left', padx=4)
+        ttk.Checkbutton(controls, text='저장본 보기', variable=self.compare_var).pack(side='left')
+        surface = ttk.Frame(self.preview_area)
+        surface.pack(fill='both', expand=True, padx=10, pady=8)
+        surface.rowconfigure(0, weight=1)
+        surface.columnconfigure(0, weight=1)
+        self.preview_label = tk.Canvas(surface, background='#20252c', highlightthickness=0, width=100, height=100)
+        self.preview_label.grid(row=0, column=0, sticky='nsew')
+        horizontal = ttk.Scrollbar(surface, orient='horizontal', command=self.preview_label.xview)
+        vertical = ttk.Scrollbar(surface, orient='vertical', command=self.preview_label.yview)
+        horizontal.grid(row=1, column=0, sticky='ew')
+        vertical.grid(row=0, column=1, sticky='ns')
+        self.preview_label.configure(xscrollcommand=horizontal.set, yscrollcommand=vertical.set)
+        self.preview_label.bind("<Configure>", self._on_preview_resize)
+        notebook = ttk.Notebook(editor)
+        notebook.pack(fill="both", expand=True)
 
         tab_basic = ttk.Frame(notebook)
         tab_colors = ttk.Frame(notebook)
@@ -108,7 +178,8 @@ class App(tk.Tk):
         search_row.pack(anchor="w", padx=15, fill="x")
         self.school_name_var = tk.StringVar(value=self.cfg.get("school_name", ""))
         ttk.Entry(search_row, textvariable=self.school_name_var, width=38).pack(side="left")
-        ttk.Button(search_row, text="검색", command=self.on_search).pack(side="left", padx=6)
+        self.search_btn = ttk.Button(search_row, text="검색", command=self.on_search)
+        self.search_btn.pack(side="left", padx=6)
 
         self.result_list = tk.Listbox(tab_basic, height=4, width=54, font=("맑은 고딕", 11))
         self.result_list.pack(anchor="w", padx=15, pady=4)
@@ -362,17 +433,21 @@ class App(tk.Tk):
         # 공통 하단 영역
         # ----------------------------------------------------
         self.status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status_var, foreground="#1a7a1a").pack(anchor="w", padx=15)
+        ttk.Label(self, textvariable=self.status_var, foreground="#1a7a1a", wraplength=950).pack(anchor="w", padx=15)
 
         btn_row = ttk.Frame(self)
         btn_row.pack(pady=10)
         self.apply_btn = ttk.Button(btn_row, text="저장 및 지금 적용", command=self.on_apply)
         self.apply_btn.pack(side="left", padx=6)
-        ttk.Button(btn_row, text="초기화", command=self.on_reset).pack(side="left", padx=6)
+        self.cancel_btn = ttk.Button(btn_row, text="변경 취소", command=self.on_cancel)
+        self.cancel_btn.pack(side="left", padx=6)
+        ttk.Button(btn_row, text="디자인 기본값", command=self.on_reset).pack(side="left", padx=6)
         ttk.Button(btn_row, text="닫기", command=self.destroy).pack(side="left", padx=6)
 
         # 실시간 바탕화면 연동 (Live Apply) 바인딩 시작
         self.bind_variables_for_live_apply()
+        self.history = EditHistory(self._collect_draft())
+        self._build_commands()
         # 위젯 구성이 끝났으니 이제부터는 사용자의 실제 조작만 실시간 적용으로 취급한다
         self._initializing = False
 
@@ -380,21 +455,111 @@ class App(tk.Tk):
         # 고정한 다음 화면 가운데에 배치하고서야 창을 보여준다 (깜빡임 방지).
         # update_idletasks()만으로는 Notebook처럼 크기 협상이 한 틱 늦게 끝나는
         # 위젯이 있어 완전히 반영되지 않는 경우가 있어 update()로 강제로 다 처리한다.
-        self.update()
-        w, h = 590, 620
+        self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        x, y = (sw - w) // 2, (sh - h) // 2
-        # 내용물이 늘어나도 창 자체는 이 크기를 넘지 못하도록 위/아래 크기를 고정한다
-        self.minsize(w, h)
-        self.maxsize(w, h)
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        self.state("normal")
-        self.update()
+        w, h = min(1200, sw - 60), min(780, sh - 80)
+        self.minsize(min(1020, w), min(650, h))
+        self.geometry(f"{w}x{h}+{max(0, (sw-w)//2)}+{max(0, (sh-h)//2)}")
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._refresh_themes()
+        self._poll_id = self.after(50, self._drain_ui_events)
         self.deiconify()
-        if self.cfg.get("school_code"):
-            threading.Thread(target=self._initial_auto_sync, daemon=True).start()
-        self.lift()
-        self.focus_force()
+        self.trigger_live_apply()
+
+    def destroy(self):
+        if getattr(self, "_applying", False):
+            messagebox.showinfo("적용 중", "적용이 끝난 뒤 창을 닫아주세요.", parent=self)
+            return
+        if (hasattr(self, 'history') and self._collect_draft() != self.cfg
+                and not messagebox.askyesno('적용하지 않은 변경', '변경을 적용하지 않고 닫을까요?', parent=self)):
+            return
+        self._closing = True
+        if hasattr(self, "_preview_worker"):
+            self._preview_worker.invalidate()
+        for timer in (getattr(self, "pending_apply", None), getattr(self, "_poll_id", None), getattr(self, "_display_after", None)):
+            if timer:
+                self.after_cancel(timer)
+        super().destroy()
+
+    def _refresh_themes(self, selected=None):
+        try:
+            self.themes = self.theme_store.list_themes()
+        except (ValueError, OSError) as error:
+            from core.themes import builtins
+            self.themes = builtins(main.merge_defaults({}))
+            self.status_var.set(f"테마 파일을 읽지 못했습니다: {error}")
+        self.theme_combo.configure(values=[item['name'] for item in self.themes])
+        self.theme_combo.set(selected or "테마를 선택하세요")
+
+    def on_theme_selected(self, event=None):
+        if self._applying:
+            return
+        index = self.theme_combo.current()
+        if 0 <= index < len(self.themes):
+            try:
+                draft = apply_style(self._collect_draft(), self.themes[index]['style'])
+                self._remember()
+                self._load_widgets(draft)
+                self.status_var.set("테마를 미리보고 있습니다. 적용 버튼을 눌러 확정하세요.")
+            except (ValueError, tk.TclError) as error:
+                messagebox.showerror("테마 선택 실패", str(error), parent=self)
+
+    def on_save_theme(self):
+        if self._applying:
+            return
+        name = simpledialog.askstring("내 테마 저장", "디자인 이름 (최대 40자)", parent=self)
+        if name is None:
+            return
+        try:
+            item = self.theme_store.save(name, self._collect_draft())
+            self._refresh_themes(item['name'])
+            self.status_var.set("디자인을 저장했습니다. 실제 배경은 적용 버튼으로 변경하세요.")
+        except (ValueError, OSError, tk.TclError) as error:
+            messagebox.showerror("테마 저장 실패", str(error), parent=self)
+
+    def _load_widgets(self, cfg):
+        self._initializing = True
+        try:
+            self._draft_base = deepcopy(cfg)
+            self.selected_school = None
+            self.search_results = []
+            self.result_list.delete(0, 'end')
+            self.day_var.set(cfg.get('display_day', 'today'))
+            self.manual_timetable = deepcopy(cfg.get('manual_timetable', []))
+            self._manual_identity = identity(cfg)
+            self.selected_school_var.set(f"현재 선택된 학교: {cfg.get('school_name') or '없음'}")
+            for key, variable in (("school_name", self.school_name_var), ("grade", self.grade_var), ("classnm", self.class_var)):
+                variable.set(cfg.get(key, ""))
+            self.photo_mode.set(cfg.get('bg_photo_mode', 'auto'))
+            self.preset_combo.current(cfg.get('bg_photo_idx', 0))
+            self.photo_path.set(cfg.get('custom_background') or '')
+            self.dday_count_var.set(cfg.get('dday_count', 3))
+            self.manual_dday = deepcopy(cfg.get('manual_dday', []))
+            self._refresh_manual_dday_list()
+            for key, variable in self.colors_vars.items():
+                variable.set(cfg['font_colors'][key])
+                self.update_color_button_visuals(key)
+            for section, variables in self.sec_vars.items():
+                for key, variable in variables.items():
+                    variable.set(cfg['sections'][section][key])
+                    if key in self.label_vars[section]:
+                        self.label_vars[section][key].set(str(cfg['sections'][section][key]))
+            self.update_bg_ui_state()
+        finally:
+            self._initializing = False
+        self.trigger_live_apply()
+
+    def on_cancel(self):
+        if self._applying:
+            return
+        self._remember()
+        self.selected_school = None
+        self.search_results = []
+        self.result_list.delete(0, tk.END)
+        self._load_widgets(deepcopy(self.cfg))
+        self.selected_school_var.set(self._selected_school_label())
+        self.theme_combo.set("마지막 적용 상태")
+        self.status_var.set("변경을 취소했습니다. 마지막 적용 상태로 돌아왔습니다.")
 
     def make_scrollable_tab(self, parent):
         """섹션 탭 안에 위젯이 많아져도(예: 수동 학사일정 목록) 창 높이를 넘어가면
@@ -419,6 +584,8 @@ class App(tk.Tk):
 
     def make_slider_callback(self, sec_name, key, var):
         def callback(val):
+            if getattr(self, '_initializing', False):
+                return
             val_int = int(float(val))
             var.set(val_int)
             self.label_vars[sec_name][key].set(str(val_int))
@@ -434,6 +601,11 @@ class App(tk.Tk):
         return callback
 
     def bind_variables_for_live_apply(self):
+        for variable in (self.day_var, self.school_name_var, self.grade_var, self.class_var):
+            variable.trace_add('write', self.trigger_live_apply)
+        self.zoom_var.trace_add('write', lambda *args: self._display_preview())
+        self.grid_var.trace_add('write', lambda *args: self._display_preview())
+        self.compare_var.trace_add('write', self.trigger_live_apply)
         # 1. 배경 설정 관련
         self.photo_mode.trace_add("write", self.trigger_live_apply)
         self.preset_combo.bind("<<ComboboxSelected>>", self.trigger_live_apply)
@@ -453,6 +625,9 @@ class App(tk.Tk):
     def trigger_live_apply(self, *args):
         if getattr(self, "_initializing", False):
             return  # 창을 여는 중 위젯 초기값 세팅으로 인한 트리거는 무시
+        if hasattr(self, 'history'):
+            self._update_dirty()
+        self._preview_revision += 1
         self._preview_worker.invalidate()
         if self.pending_apply:
             self.after_cancel(self.pending_apply)
@@ -515,70 +690,162 @@ class App(tk.Tk):
         self._refresh_manual_dday_list()
         self.trigger_live_apply()
 
+    def _collect_draft(self):
+        cfg = deepcopy(self._draft_base)
+        if self.selected_school:
+            school = self.selected_school
+            cfg.update(edu_code=school['ATPT_OFCDC_SC_CODE'], school_code=school['SD_SCHUL_CODE'],
+                       school_name=school['SCHUL_NM'], school_kind=school['SCHUL_KND_SC_NM'])
+        else:
+            cfg['school_name'] = self.school_name_var.get().strip()
+        cfg.update(grade=self.grade_var.get().strip(), classnm=self.class_var.get().strip(),
+                   bg_photo_mode=self.photo_mode.get(), bg_photo_idx=max(0, self.preset_combo.current()),
+                   custom_background=self.photo_path.get().strip() or None,
+                   dday_count=self._safe_dday_count(), manual_dday=deepcopy(self.manual_dday))
+        cfg['display_day'] = self.day_var.get()
+        cfg['manual_timetable'] = deepcopy(self.manual_timetable) if identity(cfg) == self._manual_identity else []
+        cfg['font_colors'] = {key: variable.get() for key, variable in self.colors_vars.items()}
+        cfg['sections'] = {name: {key: variable.get() for key, variable in variables.items()}
+                           for name, variables in self.sec_vars.items()}
+        return cfg
+
     def perform_live_apply(self):
         self.pending_apply = None
-
-        # 임시 설정 객체 취합
-        font_colors = {k: v.get() for k, v in self.colors_vars.items()}
-        
-        sections_data = {}
-        for s in ["school_info", "timetable", "meals", "date_info", "dday"]:
-            sections_data[s] = {
-                "show": self.sec_vars[s]["show"].get(),
-                "x": self.sec_vars[s]["x"].get(),
-                "y": self.sec_vars[s]["y"].get(),
-                "font_size": self.sec_vars[s]["font_size"].get(),
-                "stroke_width": self.sec_vars[s]["stroke_width"].get(),
-                "shadow_blur": self.sec_vars[s]["shadow_blur"].get(),
-                "shadow_opacity": self.sec_vars[s]["shadow_opacity"].get()
-            }
-            
-        cfg = {
-            "school_name": self.school_name_var.get().strip() or self.cfg.get("school_name", ""),
-            "grade": self.grade_var.get().strip(),
-            "classnm": self.class_var.get().strip(),
-            "bg_photo_mode": self.photo_mode.get(),
-            "bg_photo_idx": self.preset_combo.current(),
-            "custom_background": self.photo_path.get().strip() or None,
-            "dday_count": self._safe_dday_count(),
-            "manual_dday": self.manual_dday,
-            "font_colors": font_colors,
-            "sections": sections_data
-        }
-
-        snapshot = deepcopy(self.cfg)
-        snapshot.update(cfg)
-        self._preview_worker.submit(snapshot)
+        try:
+            cfg = self._collect_draft()
+            # School/class-specific corrections must not silently follow another class.
+            if identity(cfg) != self._manual_identity:
+                self.manual_timetable = []
+                cfg['manual_timetable'] = []
+                self._manual_identity = identity(cfg)
+                self.status_var.set('학교·학급이 바뀌어 이전 수동 시간표 보정을 비웠습니다. 실행 취소로 복원할 수 있습니다.')
+            self.history.record(cfg)
+            self._update_dirty()
+            render_cfg = deepcopy(self.cfg) if self.compare_var.get() else deepcopy(cfg)
+            cache = self._preview_cache(render_cfg)
+            day = target_day(render_cfg, main.datetime.now()).strftime('%Y%m%d')
+            self.preview_note.configure(text=(
+                "학교 미설정 · 예시 데이터입니다. 학교를 선택한 뒤 적용하세요."
+                if not render_cfg.get('school_code') else
+                ('저장본 · ' if self.compare_var.get() else '편집본 · ') +
+                describe_cache(cache, day).replace('오늘', '선택 날짜')))
+            render_cfg['_preview_revision'] = self._preview_revision
+            self._preview_worker.submit(render_cfg)
+        except (ValueError, tk.TclError) as error:
+            self.status_var.set(f"입력값을 확인해주세요: {error}")
 
     def _render_live_apply(self, cfg, commit):
-        with desktop_transaction(main.BASE_DIR):
-            current = main.load_config() or self.cfg
-            if identity(cfg) != identity(current):
-                return
-            cache = main.load_data_cache(cfg)
-            path = main.render_wallpaper(cfg, main.datetime.now(),
-                cache['timetable'], cache['meals'], cache.get('schedule'))
-            applied = commit(lambda: main.set_wallpaper(path))
-        if applied:
-            self.after(0, lambda: self.status_var.set("바탕화면 실시간 반영됨 ✓"))
-
-    def _initial_auto_sync(self):
+        revision = cfg.pop('_preview_revision', self._preview_revision)
         try:
-            ok = main.update_once(main.load_config() or self.cfg)
-            if ok:
-                self.after(0, lambda: self.status_var.set("오늘 데이터 동기화 완료 ✓"))
+            image = self._compose_preview(cfg)
+            commit(lambda: self._ui_events.put(('preview', revision, image, None)))
         except Exception as error:
-            message = str(error)
-            self.after(0, lambda: self.status_var.set(message))
-        finally:
-            self.after(60000, self._periodic_check)
+            commit(lambda: self._ui_events.put(('preview', revision, None, str(error))))
 
-    def _periodic_check(self):
-        today = main.datetime.now().strftime("%Y%m%d")
-        if main.read_today_cache_if_matching(self.cfg, today) is None:
-            threading.Thread(target=self._initial_auto_sync, daemon=True).start()
-        else:
-            self.after(60000, self._periodic_check)
+    def _compose_preview(self, cfg):
+        cfg = deepcopy(cfg)
+        cache = self._preview_cache(cfg)
+        if not cfg.get('school_code'):
+            cfg['school_name'] = '우리 학교 · 예시'
+            cache = {'timetable': [{'period': '1', 'subject': '국어'}, {'period': '2', 'subject': '수학'}],
+                     'meals': [{'name': '중식', 'dishes': '잡곡밥\n김치찌개\n과일'}], 'schedule': []}
+        return main.compose_wallpaper(cfg, main.datetime.now(), cache['timetable'], cache['meals'],
+                                      cache.get('schedule'), size=self.screen_size)
+
+    def _drain_ui_events(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                kind, a, b, error = self._ui_events.get_nowait()
+                if kind == 'preview':
+                    if a != self._preview_revision:
+                        continue
+                    if error:
+                        self.status_var.set(f"미리보기 실패: {error}")
+                    else:
+                        self._preview_image = b
+                        self._display_preview()
+                elif kind == 'applied':
+                    self._applying = False
+                    for button in (self.apply_btn, self.cancel_btn, self.save_theme_btn):
+                        button.configure(state='normal')
+                    self.theme_combo.configure(state='readonly')
+                    if error:
+                        self.status_var.set(f"적용 실패: {error}")
+                        messagebox.showerror("적용 실패", error, parent=self)
+                    else:
+                        current_draft = self._collect_draft()
+                        self.cfg = deepcopy(a)
+                        self._session_cache = None
+                        self._load_widgets(current_draft)
+                        warning = b.get('autostart_error') or b.get('warning') or ' / '.join(b.get('warnings', []))
+                        self.status_var.set(f"배경 적용 완료 · {warning}" if warning else "저장한 디자인을 바탕화면에 적용했습니다 ✓")
+                        self.trigger_live_apply()
+                elif kind == 'refreshed':
+                    self._refreshing = False
+                    self.refresh_btn.configure(state='normal')
+                    current = self._collect_draft()
+                    current_key = (identity(current), target_day(current, main.datetime.now()).strftime('%Y%m%d'))
+                    if error:
+                        self.status_var.set(f'새로고침 실패: {error}')
+                    elif a == current_key:
+                        self._session_cache = (a, deepcopy(b))
+                        self.status_var.set('학교 데이터를 새로고침했습니다. 편집 중인 설정은 유지됩니다.')
+                        self.trigger_live_apply()
+                    else:
+                        self.status_var.set('조회 중 학교·날짜가 변경되었습니다. 현재 선택으로 다시 새로고침하세요.')
+                elif kind == 'exported':
+                    self.status_var.set(f'이미지 내보내기 실패: {error}' if error else f'이미지를 저장했습니다: {a}')
+                elif kind == 'searched':
+                    self._searching = False
+                    self.search_btn.configure(state='normal')
+                    if a != self.school_name_var.get().strip():
+                        continue
+                    if error:
+                        self.status_var.set(f'학교 검색 실패: {error}')
+                        continue
+                    self.search_results = b
+                    self.selected_school = None
+                    self.selected_school_var.set('검색 결과에서 학교를 선택해주세요')
+                    self.result_list.delete(0, tk.END)
+                    for school in b:
+                        self.result_list.insert(tk.END, f"{school['SCHUL_NM']}  [{school['SCHUL_KND_SC_NM']}]  {school.get('ORG_RDNMA', '')}")
+                    if not b:
+                        self.result_list.insert(tk.END, '(검색 결과 없음)')
+                    self.status_var.set(f'학교 {len(b)}곳을 찾았습니다.')
+        except queue.Empty:
+            pass
+        self._poll_id = self.after(50, self._drain_ui_events)
+
+    def _on_preview_resize(self, event=None):
+        self.preview_note.configure(wraplength=max(100, self.preview_area.winfo_width() - 32))
+        if self._display_after:
+            self.after_cancel(self._display_after)
+        self._display_after = self.after(100, self._display_preview)
+
+    def _display_preview(self):
+        self._display_after = None
+        if self._preview_image is None or self._closing:
+            return
+        image = self._preview_image.copy()
+        if self.grid_var.get():
+            draw = ImageDraw.Draw(image)
+            for step in range(1, 10):
+                x, y = image.width * step // 10, image.height * step // 10
+                draw.line((x, 0, x, image.height), fill='#7eabb3', width=1)
+                draw.line((0, y, image.width, y), fill='#7eabb3', width=1)
+        width, height = max(100, self.preview_label.winfo_width()), max(100, self.preview_label.winfo_height())
+        zoom = self.zoom_var.get()
+        if zoom == '화면에 맞춤':
+            image.thumbnail((width, height), Image.Resampling.LANCZOS)
+        elif zoom == '150%':
+            image = image.resize((image.width * 3 // 2, image.height * 3 // 2), Image.Resampling.LANCZOS)
+        self._preview_photo = ImageTk.PhotoImage(image, master=self)
+        self.preview_label.delete('all')
+        x, y = max(0, (width-image.width)//2), max(0, (height-image.height)//2)
+        self.preview_label.create_image(x, y, image=self._preview_photo, anchor='nw')
+        self.preview_label.configure(scrollregion=(0, 0, max(width, image.width), max(height, image.height)))
 
     def update_color_button_visuals(self, key):
         if key in self.color_buttons:
@@ -651,28 +918,25 @@ class App(tk.Tk):
         if selection and self.search_results and selection[0] < len(self.search_results):
             self.selected_school = self.search_results[selection[0]]
             self.selected_school_var.set(self._selected_school_label())
+            self.trigger_live_apply()
 
     def on_search(self):
+        if self._searching or self._applying:
+            return
         name = self.school_name_var.get().strip()
         if not name:
             messagebox.showwarning("입력 필요", "학교 이름을 입력해주세요.")
             return
-        try:
-            self.search_results = search_school(name)
-        except Exception as e:
-            messagebox.showerror("검색 실패", str(e))
-            return
-        # 새로 검색하면 이전에 선택했던 학교는 더 이상 유효하지 않으므로 비운다.
-        # (이전 선택을 그대로 들고 있으면, 새 검색 결과를 클릭하지 않고 바로
-        # 저장할 때 옛날 학교로 조용히 저장되는 버그가 있었다)
+        self._searching = True
         self.selected_school = None
-        self.selected_school_var.set("검색 결과에서 학교를 클릭해주세요")
-        self.result_list.delete(0, tk.END)
-        if not self.search_results:
-            self.result_list.insert(tk.END, "(검색 결과 없음)")
-            return
-        for r in self.search_results:
-            self.result_list.insert(tk.END, f"{r['SCHUL_NM']}  [{r['SCHUL_KND_SC_NM']}]  {r['ORG_RDNMA']}")
+        self.search_btn.configure(state='disabled')
+        self.status_var.set('학교를 검색하고 있습니다…')
+        def search():
+            try:
+                self._ui_events.put(('searched', name, search_school(name), None))
+            except Exception as error:
+                self._ui_events.put(('searched', name, None, str(error)))
+        threading.Thread(target=search, daemon=True).start()
 
     def on_browse_photo(self):
         path = filedialog.askopenfilename(
@@ -685,124 +949,42 @@ class App(tk.Tk):
             self.update_bg_ui_state()
 
     def on_apply(self):
-        self._preview_worker.invalidate()
-        if self.pending_apply:
-            self.after_cancel(self.pending_apply)
-            self.pending_apply = None
-        api_key = self.cfg.get("api_key", main.API_KEY)
-        grade = self.grade_var.get().strip()
-        classnm = self.class_var.get().strip()
-
-        if not grade or not classnm:
-            messagebox.showwarning("입력 필요", "학년, 반을 모두 입력해주세요.")
+        if self._applying or self._searching:
             return
-
-        # (안전망) Apply 시점에도 한 번 더 현재 리스트 선택을 확인한다
-        selection = self.result_list.curselection()
-        if selection and self.search_results and selection[0] < len(self.search_results):
-            self.selected_school = self.search_results[selection[0]]
-
-        typed_name = self.school_name_var.get().strip()
-
-        # self.selected_school은 on_search()에서 검색할 때마다 매번 비워지므로,
-        # 여기서 값이 있다는 것은 "가장 최근 검색 결과에서 실제로 클릭했다"는
-        # 뜻이다. 검색창에 입력한 텍스트(부분 검색어일 수 있음)와 굳이 이름이
-        # 똑같은지 다시 확인할 필요는 없다 — 클릭한 결과를 그대로 신뢰한다.
-        if self.selected_school:
-            school = self.selected_school
-            kind = school["SCHUL_KND_SC_NM"]
-            if kind not in SCHOOL_LEVEL_ENDPOINT:
-                kind = "중학교"
-            new_cfg = {
-                "api_key": api_key,
-                "edu_code": school["ATPT_OFCDC_SC_CODE"],
-                "school_code": school["SD_SCHUL_CODE"],
-                "school_name": school["SCHUL_NM"],
-                "school_kind": kind,
-                "grade": grade,
-                "classnm": classnm,
-            }
-        elif all(k in self.cfg for k in ("edu_code", "school_code", "school_name", "school_kind")):
-            # 새로 선택한 학교가 없다면 기존 저장된 학교를 유지한다 — 단, 검색창에
-            # 입력된 이름이 기존 학교와 다르면 사용자가 학교를 바꾸려다 클릭을
-            # 빠뜨린 것일 수 있으므로 조용히 넘어가지 않고 먼저 확인한다
-            if typed_name and typed_name != self.cfg.get("school_name"):
-                messagebox.showwarning(
-                    "학교 선택 필요",
-                    f"'{typed_name}'을(를) 검색만 하고 목록에서 클릭하지 않으셨습니다.\n"
-                    "검색 결과에서 원하는 학교를 클릭한 뒤 다시 시도해주세요.",
-                )
-                return
-            new_cfg = dict(self.cfg)
-            new_cfg.update({"api_key": api_key, "grade": grade, "classnm": classnm})
-        else:
-            messagebox.showwarning("학교 선택 필요", "검색 후 목록에서 학교를 선택해주세요.")
-            return
-
-        new_cfg["bg_photo_mode"] = self.photo_mode.get()
-        new_cfg["bg_photo_idx"] = self.preset_combo.current()
-        new_cfg["custom_background"] = self.photo_path.get().strip() or None
-        new_cfg["dday_count"] = self._safe_dday_count()
-        new_cfg["manual_dday"] = self.manual_dday
-
-        new_cfg["font_colors"] = {k: v.get() for k, v in self.colors_vars.items()}
-        
-        # 섹션 설정 수집
-        sections_data = {}
-        for s in ["school_info", "timetable", "meals", "date_info", "dday"]:
-            sections_data[s] = {
-                "show": self.sec_vars[s]["show"].get(),
-                "x": self.sec_vars[s]["x"].get(),
-                "y": self.sec_vars[s]["y"].get(),
-                "font_size": self.sec_vars[s]["font_size"].get(),
-                "stroke_width": self.sec_vars[s]["stroke_width"].get(),
-                "shadow_blur": self.sec_vars[s]["shadow_blur"].get(),
-                "shadow_opacity": self.sec_vars[s]["shadow_opacity"].get()
-            }
-        new_cfg["sections"] = sections_data
-        
-        # 하위 호환성을 위한 전역 text_effects 유지
-        new_cfg["text_effects"] = {
-            "stroke_width": self.sec_vars["school_info"]["stroke_width"].get(),
-            "stroke_color": "#000000",
-            "shadow_blur": self.sec_vars["school_info"]["shadow_blur"].get(),
-            "shadow_opacity": self.sec_vars["school_info"]["shadow_opacity"].get()
-        }
-
-        self.cfg = new_cfg
-        save_config(new_cfg)
-        self.school_name_var.set(new_cfg.get("school_name", ""))
-        self.selected_school_var.set(self._selected_school_label())
-
-        self.apply_btn.config(state="disabled")
-        self.status_var.set("적용 중... (사진/시간표/급식을 가져오는 중)")
-        threading.Thread(target=self._run_engine, daemon=True).start()
-
-    def _run_engine(self):
         try:
-            creationflags = 0
-            if sys.platform == "win32":
-                creationflags = subprocess.CREATE_NO_WINDOW
+            cfg = self._collect_draft()
+            if not cfg.get('school_code') or not cfg.get('grade') or not cfg.get('classnm'):
+                raise ValueError("학교를 검색·선택하고 학년과 반을 입력해주세요.")
+            if not self.selected_school and cfg['school_name'] != self._draft_base.get('school_name'):
+                raise ValueError("학교 이름을 바꿨다면 검색 결과에서 학교를 선택해주세요.")
+            # Validate display values without including private school data in themes.
+            cfg = apply_style(cfg, extract_style(cfg))
+            if identity(cfg) != self._manual_identity:
+                cfg['manual_timetable'] = []
+                self.manual_timetable = []
+                self._manual_identity = identity(cfg)
+            validate_overrides(cfg.get('manual_timetable', []))
+            if cfg.get('bg_photo_mode') == 'custom':
+                if not cfg.get('custom_background'):
+                    raise ValueError("배경 사진을 선택해주세요.")
+                with Image.open(cfg['custom_background']) as photo:
+                    photo.verify()
+        except (ValueError, OSError, tk.TclError) as error:
+            messagebox.showwarning("입력 확인", str(error), parent=self)
+            return
+        self._applying = True
+        for button in (self.apply_btn, self.cancel_btn, self.save_theme_btn):
+            button.configure(state='disabled')
+        self.theme_combo.configure(state='disabled')
+        self.status_var.set("디자인을 저장하고 바탕화면에 적용하고 있습니다…")
+        threading.Thread(target=self._run_engine, args=(deepcopy(cfg),), daemon=True).start()
 
-            # Use sys.executable (which is this .exe if bundled) with --background flag
-            cmd = [sys.executable, "--background"]
-            if not getattr(sys, "frozen", False):
-                cmd = [sys.executable, os.path.join(main.ROOT_DIR, "app.py"), "--background"]
-
-            result = subprocess.run(cmd, capture_output=True, timeout=150, creationflags=creationflags)
-            ok = result.returncode == 0
-        except Exception as e:
-            ok = False
-            print(e)
-        self.after(0, self._on_engine_done, ok)
-
-    def _on_engine_done(self, ok):
-        self.apply_btn.config(state="normal")
-        if ok:
-            self.status_var.set("바탕화면에 적용되었습니다 ✓")
-        else:
-            self.status_var.set("적용 실패 — 설정을 다시 확인해주세요")
-            messagebox.showerror("적용 실패", "바탕화면 적용 중 오류가 발생했습니다. 입력값을 확인해주세요.")
+    def _run_engine(self, cfg):
+        try:
+            result = main.apply_configuration(cfg)
+            self._ui_events.put(('applied', cfg, result, None))
+        except Exception as error:
+            self._ui_events.put(('applied', cfg, None, str(error)))
 
 
 if __name__ == "__main__":

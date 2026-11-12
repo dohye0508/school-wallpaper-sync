@@ -10,6 +10,8 @@ dist/
 bg_cache/
 wallpaper.png
 config.json
+data_cache.json
+themes.json
 학교바탕화면설정.exe
 SchoolWallpaper.exe
 wallpaper_1.png

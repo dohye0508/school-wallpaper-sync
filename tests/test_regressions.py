@@ -83,6 +83,16 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(data['timetable'], [])
         self.assertEqual(data['states'], {'meals': 'cached', 'timetable': 'empty'})
 
+    def test_failed_empty_cache_is_not_promoted_but_successful_empty_cache_is(self):
+        cached = {'meals': [], 'timetable': [],
+                  'states': {'meals': 'unavailable', 'timetable': 'empty'}}
+        data = resolve_data({'meals': None, 'timetable': None}, cached)
+        self.assertEqual(data['states'], {'meals': 'unavailable', 'timetable': 'cached'})
+        retried = resolve_data({'meals': None, 'timetable': None}, data)
+        self.assertEqual(retried['states'], data['states'])
+        recovered = resolve_data({'meals': ['밥'], 'timetable': None}, retried)
+        self.assertEqual(recovered['states'], {'meals': 'fresh', 'timetable': 'cached'})
+
     def test_cache_scoped_to_school_class_and_day(self):
         main.save_data_cache(['수학'], [], self.today, self.cfg, [])
         self.assertIsNotNone(main.read_today_cache_if_matching(self.cfg, self.today))
