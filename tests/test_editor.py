@@ -204,7 +204,7 @@ class EditorTests(unittest.TestCase):
         self.app._on_preview_resize()
         self.app.update_idletasks()
         self.assertEqual((self.app.winfo_width(), self.app.winfo_height()), (width, height))
-        for name in ('theme_combo', 'save_theme_btn', 'apply_btn', 'cancel_btn', 'preview_area', 'preview_label'):
+        for name in ('theme_combo', 'save_theme_btn', 'apply_btn', 'cancel_btn', 'menu_btn', 'preview_area', 'preview_label'):
             widget = getattr(self.app, name)
             # Canvas.winfo_rootx() is zero until a native window is mapped. Its
             # geometry and parent allocations are still available without mapping.
@@ -422,11 +422,31 @@ class EditorTests(unittest.TestCase):
         self.app._display_preview()
         region150 = tuple(map(float, self.app.preview_label.cget('scrollregion').split()))
         self.assertGreater(region150[2], region100[2])
-        self.assertGreater(region150[3], region100[3])
+        self.assertGreaterEqual(region150[3], region100[3])
+        self.assertEqual((self.app._preview_photo.width(), self.app._preview_photo.height()), (960, 540))
         self.assertEqual(self.app._preview_image.tobytes(), pixels)
         self.app.compare_var.set(True)
         self.settle_preview()
         self.assertEqual(self.app._collect_draft(), original)
+        self.assert_saved_unchanged()
+
+    def test_large_command_menu_keeps_export_action_reachable(self):
+        from tkinter import font
+        from ui_widgets import CommandPopup
+        with patch.object(CommandPopup, 'deiconify'), patch.object(CommandPopup, 'grab_set'):
+            self.app.on_menu()
+        menu = self.app._command_popup
+        self.app.update_idletasks()
+        self.assertLessEqual(menu.winfo_reqheight(), 600)
+        self.assertLessEqual(menu.winfo_reqwidth(), 1000)
+        for button in menu.buttons:
+            configured = settings_gui.ttk.Style(self.app).lookup(button.cget('style'), 'font')
+            self.assertGreaterEqual(font.Font(root=self.app, font=configured).actual('size'), 13)
+        export = next(button for button in menu.buttons if button.cget('text') == 'PNG 내보내기…')
+        with patch.object(settings_gui.filedialog, 'asksaveasfilename', return_value='') as choose:
+            export.invoke()
+            choose.assert_called_once()
+        self.assertFalse(menu.winfo_exists())
         self.assert_saved_unchanged()
 
     def test_alignment_changes_only_target_section_and_is_undoable(self):

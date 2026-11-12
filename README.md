@@ -1,4 +1,4 @@
-# School Wallpaper Sync v1.4 (Daily Timetable & Meal Scheduler)
+# School Wallpaper Sync v1.4.1 (Daily Timetable & Meal Scheduler)
 
 A Windows desktop assistant that automatically syncs and displays your daily class timetable, school meals, and upcoming school-schedule D-Days directly on an aesthetic desktop wallpaper.
 
@@ -26,13 +26,15 @@ A Windows desktop assistant that automatically syncs and displays your daily cla
 ## 🚀 How to Get Started
 
 1. Download and run `SchoolWallpaperSettings.exe` (from a [Release](../../releases/latest) or built yourself, see below).
-2. On the **기본 설정** tab: type your school name, hit 검색, pick your school from the results, then enter your grade and class.
+2. On the **학교** tab: type your school name, hit 검색, pick your school from the results, then enter your grade and class.
 3. Pick a background: automatic daily rotation, a fixed one of the 8 built-ins, or your own photo file.
-4. Click **저장 및 지금 적용**. Your wallpaper updates immediately, and from then on it keeps itself up to date automatically — you don't need to do anything else.
-5. Choose a built-in theme or adjust colors, position, font size, and shadows. Changes appear only in the **적용 전 미리보기** panel. Click **현재 디자인 저장** to keep a named design, **저장 및 지금 적용** to activate it, or **변경 취소** to restore the last applied state.
-6. Saved designs live in `themes.json` beside the EXE. Use the **테마** menu to duplicate, rename, delete or exchange designs. Duplicate names are rejected. Existing `config.json` settings are retained; reading the library does not create a file.
-7. Choose **오늘 / 내일**, use **데이터 새로고침** (F5), and open **급식 상세** or **수동 시간표** as needed. Changing the selected date or a manual subject affects the draft until you apply it. Changing school/class clears previous manual timetable corrections.
-8. Use the **파일** menu to back up the current editing settings, load a backup, or export the current design as PNG. Backup files include school information, visual settings, selected day and manual events/timetable corrections, but exclude API keys, original photo files and the theme library. Keep photos and `themes.json` separately.
+4. Click **적용**. Your wallpaper updates immediately, and from then on it keeps itself up to date automatically — you don't need to keep the editor open.
+5. Use **배경 / 색상 / 배치 / 학교** to edit. Theme selection and **저장** are on the background tab. Changes appear in **미리보기** until you click **적용**. **변경 취소** restores the last applied settings.
+6. The bottom **메뉴** button (F10) opens large-text commands for backup, editing and theme management. Saved designs live in `themes.json` beside the EXE; duplicate names are rejected.
+7. On **학교**, choose **오늘 / 내일**, use **새로고침** (F5), or open **급식 상세**, **수동 시간표**, and **조회 상태**. Changing school/class clears previous manual timetable corrections.
+8. **메뉴 → 파일** contains settings backup/restore and PNG export. Backups include school information, visual settings, selected day and manual events/timetable corrections, but exclude API keys, original photo files and the theme library. Keep photos and `themes.json` separately.
+
+v1.4.1 reduces always-visible controls and explanatory text. Preview tools sit below the image; photo inputs and school search results appear only when needed. Color swatches replace hexadecimal labels. Detailed status remains available from **조회 상태** or by clicking a status message at the bottom.
 
 The preview uses cached or explicitly refreshed data for the selected school and date. If no school is configured, it shows clearly labeled sample data. If a school is configured but has no matching cache, use F5 or Apply to fetch data. Refreshing an unapplied tomorrow draft does not overwrite the active today's cache. Opening the editor does not apply a wallpaper or register scheduled tasks; existing background tasks continue using the saved settings.
 
@@ -49,8 +51,9 @@ Theme exports reference custom photos by path and do not bundle the image. On an
 | Ctrl+0 | Fit the preview to its panel |
 | F5 | Refresh school data for the selected date |
 | F1 | Open usage instructions |
+| F10 | Open the command menu |
 
-Download the Windows executable, source archive, SHA-256 checksum and validation report from the [v1.4.0 release](https://github.com/dohye0508/school-wallpaper-sync/releases/tag/v1.4.0).
+Download the Windows executable, source archive and SHA-256 checksum from the [v1.4.1 release](https://github.com/dohye0508/school-wallpaper-sync/releases/tag/v1.4.1).
 
 ---
 
