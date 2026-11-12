@@ -30,11 +30,29 @@ A Windows desktop assistant that automatically syncs and displays your daily cla
 ## 🛠️ Building from Source
 
 ```bash
-pip install pillow requests
+pip install -r requirements-dev.txt
 build.bat
 ```
 
 This produces `SchoolWallpaperSettings.exe` in the project root. `main.py` is the engine (also runnable standalone with `--background` for silent updates, or `--reset` to clear saved settings); `settings_gui.py` is the GUI; `app.py` is the entry point that picks between them.
+
+## Development and regression checks
+
+```bash
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python -m compileall -q main.py app.py settings_gui.py core adapters
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for synchronization guarantees and the Android boundary.
+Rebuild the executable after changing sources; an existing EXE does not contain these fixes.
+
+Windowless background runs record results in `sync.log` (rotated) and `last_run.json`
+beside the executable. A missing school configuration or failed Task Scheduler registration
+now returns a nonzero exit code. The two Windows tasks use an interactive user token,
+run on battery power, and retain their existing start time when the configuration is unchanged.
+The `hooks/` directory preserves extra SSL policy data when building with a managed
+Python distribution; keep `--additional-hooks-dir hooks` when invoking PyInstaller directly.
 
 ---
 

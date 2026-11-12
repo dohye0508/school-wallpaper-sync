@@ -1,4 +1,7 @@
 __pycache__/
+.sync.lock
+sync.log*
+last_run.json
 *.pyc
 build/
 build_gui/

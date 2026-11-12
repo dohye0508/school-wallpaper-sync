@@ -11,6 +11,10 @@ import os
 import subprocess
 import sys
 import threading
+from copy import deepcopy
+from core.latest import LatestWorker
+from core.sync import identity
+from core.storage import desktop_transaction
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, colorchooser
 
@@ -42,15 +46,8 @@ def save_config(cfg):
 
 
 def search_school(name):
-    resp = requests.get(
-        f"{NEIS_BASE}/schoolInfo",
-        params={"KEY": main.API_KEY, "Type": "json", "SCHUL_NM": name, "pSize": 20},
-        timeout=10,
-    )
-    data = json.loads(resp.content.decode("utf-8"))
-    if "schoolInfo" not in data:
-        return []
-    return data["schoolInfo"][1]["row"]
+    cfg = main.load_config() or {}
+    return main.search_school(cfg.get("api_key", main.API_KEY), name)
 
 
 class App(tk.Tk):
@@ -84,13 +81,10 @@ class App(tk.Tk):
         self.search_results = []
         self.selected_school = None
         self.pending_apply = None
+        self._preview_worker = LatestWorker(self._render_live_apply)
         # 위젯을 만드는 동안 슬라이더 초기값 세팅이 command 콜백을 트리거해서
         # 창을 열자마자 원치 않는 실시간 적용이 발생하는 것을 막는 플래그
         self._initializing = True
-
-        # GUI 실행 시 오늘 날짜의 시간표/급식 데이터가 없으면 백그라운드로 자동 갱신
-        if self.cfg.get("school_code"):
-            threading.Thread(target=self._initial_auto_sync, daemon=True).start()
 
         # 탭 레이아웃 구성
         notebook = ttk.Notebook(self)
@@ -397,6 +391,8 @@ class App(tk.Tk):
         self.state("normal")
         self.update()
         self.deiconify()
+        if self.cfg.get("school_code"):
+            threading.Thread(target=self._initial_auto_sync, daemon=True).start()
         self.lift()
         self.focus_force()
 
@@ -457,6 +453,7 @@ class App(tk.Tk):
     def trigger_live_apply(self, *args):
         if getattr(self, "_initializing", False):
             return  # 창을 여는 중 위젯 초기값 세팅으로 인한 트리거는 무시
+        self._preview_worker.invalidate()
         if self.pending_apply:
             self.after_cancel(self.pending_apply)
         # 80ms 디바운스 적용으로 드래그 시 렉 줄임
@@ -549,81 +546,39 @@ class App(tk.Tk):
             "sections": sections_data
         }
 
-        # 렌더링(사진 다운로드 등)이 몇 초 걸릴 수 있어, 메인 스레드(창)에서
-        # 직접 돌리면 그동안 창 전체가 멈춰 보인다. 스레드로 빼서 창은 계속 반응하게 한다.
-        threading.Thread(target=self._render_live_apply, args=(cfg,), daemon=True).start()
+        snapshot = deepcopy(self.cfg)
+        snapshot.update(cfg)
+        self._preview_worker.submit(snapshot)
 
-    def _render_live_apply(self, cfg):
-        try:
-            cache = main.load_data_cache(self.cfg)
-            now = main.datetime.now()
-            path = main.render_wallpaper(cfg, now, cache.get("timetable") or [], cache.get("meals") or [], cache.get("schedule"))
-            main.set_wallpaper(path)
+    def _render_live_apply(self, cfg, commit):
+        with desktop_transaction(main.BASE_DIR):
+            current = main.load_config() or self.cfg
+            if identity(cfg) != identity(current):
+                return
+            cache = main.load_data_cache(cfg)
+            path = main.render_wallpaper(cfg, main.datetime.now(),
+                cache['timetable'], cache['meals'], cache.get('schedule'))
+            applied = commit(lambda: main.set_wallpaper(path))
+        if applied:
             self.after(0, lambda: self.status_var.set("바탕화면 실시간 반영됨 ✓"))
-        except Exception as e:
-            print(f"[실시간 적용 실패] {e}")
 
     def _initial_auto_sync(self):
-        """프로그램 시작 시 오늘 날짜의 시간표와 급식이 캐시되어 있지 않으면 실시간 동기화 수행.
-
-        네트워크 호출(NEIS 조회 + 사진 다운로드)에 수 초가 걸리기 때문에, 그 사이 사용자가
-        GUI에서 학교/배경/설정을 바꿔 "저장 및 지금 적용"을 눌러버리면 이 함수가 뒤늦게
-        끝나면서 오래된(stale) self.cfg 스냅샷(예: 예전 학교 코드)으로 시간표/급식을 다시
-        받아와 방금 적용한 결과를 덮어써버리는 경쟁 상태가 있었다. 그래서 데이터를 가져오는
-        시점과 렌더링하는 시점 모두 디스크에서 최신 config를 다시 읽어서 사용한다.
-        """
         try:
-            # self.cfg가 아니라 항상 디스크의 최신 설정(다른 학교로 바뀌었을 수 있음)을 사용한다
-            cfg = main.load_config() or self.cfg
-            today = main.datetime.now().strftime("%Y%m%d")
-            cache = main.load_data_cache()
-            same_school = (
-                cache.get("school_code") == cfg.get("school_code")
-                and cache.get("grade") == cfg.get("grade")
-                and cache.get("classnm") == cfg.get("classnm")
-            )
-            if cache.get("date") != today or not cache.get("timetable") or not same_school:
-                timetable = main.fetch_timetable(cfg, today)
-                meals = main.fetch_meal(cfg, today)
-                schedule = main.fetch_school_schedule(cfg, main.datetime.now())
-
-                # None은 "네이스에 데이터 없음"이 아니라 네트워크/API 호출 자체가
-                # 실패했다는 뜻이다. 와이파이가 잠깐 끊긴 것뿐인데 방금까지 잘 뜨던
-                # 화면을 빈 값으로 덮어쓰지 않도록, 오늘자 캐시가 있으면 그걸로 대체한다.
-                if timetable is None or meals is None or schedule is None:
-                    fallback = main.read_today_cache_if_matching(cfg, today)
-                    if timetable is None:
-                        timetable = (fallback.get("timetable") if fallback else None) or []
-                    if meals is None:
-                        meals = (fallback.get("meals") if fallback else None) or []
-                    if schedule is None:
-                        schedule = (fallback.get("schedule") if fallback else None) or []
-
-                main.save_data_cache(timetable, meals, today, cfg, schedule)
-
-                # 렌더링 직전에 다시 한번 최신 설정을 읽어, 그 사이 사용자가 저장한 변경사항을 존중한다
-                latest_cfg = main.load_config() or cfg
-                now = main.datetime.now()
-                path = main.render_wallpaper(latest_cfg, now, timetable, meals, schedule)
-                main.set_wallpaper(path)
-                main.ensure_autostart()
-                self.after(0, lambda: self.status_var.set("오늘 날짜 시간표/급식 동기화 완료 ✓"))
-        except Exception as e:
-            print(f"[초기 동기화 오류] {e}")
+            ok = main.update_once(main.load_config() or self.cfg)
+            if ok:
+                self.after(0, lambda: self.status_var.set("오늘 데이터 동기화 완료 ✓"))
+        except Exception as error:
+            message = str(error)
+            self.after(0, lambda: self.status_var.set(message))
         finally:
             self.after(60000, self._periodic_check)
 
     def _periodic_check(self):
-        """설정 창이 켜져 있는 동안 매 1분마다 자정 지남(날짜 변경) 여부를 확인하여 자동 갱신"""
-        try:
-            today = main.datetime.now().strftime("%Y%m%d")
-            cache = main.load_data_cache()
-            if cache.get("date") != today:
-                threading.Thread(target=self._initial_auto_sync, daemon=True).start()
-                return
-        except Exception:
-            pass
-        self.after(60000, self._periodic_check)
+        today = main.datetime.now().strftime("%Y%m%d")
+        if main.read_today_cache_if_matching(self.cfg, today) is None:
+            threading.Thread(target=self._initial_auto_sync, daemon=True).start()
+        else:
+            self.after(60000, self._periodic_check)
 
     def update_color_button_visuals(self, key):
         if key in self.color_buttons:
@@ -730,7 +685,11 @@ class App(tk.Tk):
             self.update_bg_ui_state()
 
     def on_apply(self):
-        api_key = main.API_KEY
+        self._preview_worker.invalidate()
+        if self.pending_apply:
+            self.after_cancel(self.pending_apply)
+            self.pending_apply = None
+        api_key = self.cfg.get("api_key", main.API_KEY)
         grade = self.grade_var.get().strip()
         classnm = self.class_var.get().strip()
 
@@ -828,9 +787,9 @@ class App(tk.Tk):
             # Use sys.executable (which is this .exe if bundled) with --background flag
             cmd = [sys.executable, "--background"]
             if not getattr(sys, "frozen", False):
-                cmd = [sys.executable, "app.py", "--background"]
+                cmd = [sys.executable, os.path.join(main.ROOT_DIR, "app.py"), "--background"]
 
-            result = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=creationflags)
+            result = subprocess.run(cmd, capture_output=True, timeout=150, creationflags=creationflags)
             ok = result.returncode == 0
         except Exception as e:
             ok = False

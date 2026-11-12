@@ -14,6 +14,12 @@
    `--reset` 인자로 실행하면 저장된 학교/반 설정을 지우고 다시 설정할 수 있음
 """
 
+from adapters.windows import get_screen_size, set_wallpaper, ensure_autostart
+from copy import deepcopy
+from core.neis import neis_get, search_school, fetch_meal, fetch_timetable, fetch_school_schedule
+from core.storage import atomic_json, desktop_transaction
+from core.sync import identity, resolve_data
+
 import ctypes
 import json
 import os
@@ -197,11 +203,11 @@ def merge_defaults(cfg):
         cfg = {}
     for k, v in DEFAULT_CONFIG.items():
         if k not in cfg:
-            cfg[k] = v
+            cfg[k] = deepcopy(v)
         elif isinstance(v, dict):
             for sub_k, sub_v in v.items():
                 if sub_k not in cfg[k]:
-                    cfg[k][sub_k] = sub_v
+                    cfg[k][sub_k] = deepcopy(sub_v)
                 elif isinstance(sub_v, dict) and isinstance(cfg[k][sub_k], dict):
                     # Deep merge sections properties
                     for s_k, s_v in sub_v.items():
@@ -219,7 +225,7 @@ def hex_to_rgba(hex_str, alpha=255):
         return (r, g, b, a)
     return (255, 255, 255, alpha)
 
-def save_data_cache(timetable, meals, ymd=None, cfg=None, schedule=None):
+def save_data_cache(timetable, meals, ymd=None, cfg=None, schedule=None, states=None):
     os.makedirs(os.path.dirname(DATA_CACHE_PATH), exist_ok=True)
     if ymd is None:
         ymd = datetime.now().strftime("%Y%m%d")
@@ -228,15 +234,17 @@ def save_data_cache(timetable, meals, ymd=None, cfg=None, schedule=None):
         "timetable": timetable,
         "meals": meals,
         "schedule": schedule,
+        "states": states or {},
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         # 어느 학교/학년/반의 데이터인지 함께 기록해서, 학교를 바꿨는데도
         # "오늘 날짜"라는 이유만으로 이전 학교의 캐시를 재사용하는 것을 방지한다
+        "edu_code": (cfg or {}).get("edu_code"),
+        "school_kind": (cfg or {}).get("school_kind"),
         "school_code": (cfg or {}).get("school_code"),
         "grade": (cfg or {}).get("grade"),
         "classnm": (cfg or {}).get("classnm"),
     }
-    with open(DATA_CACHE_PATH, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
+    atomic_json(DATA_CACHE_PATH, cache)
 
 def read_today_cache_if_matching(cfg, ymd):
     """네트워크 호출 없이, 오늘 날짜 + 같은 학교/학년/반의 캐시가 있으면 그대로 읽어온다.
@@ -249,117 +257,20 @@ def read_today_cache_if_matching(cfg, ymd):
             cache = json.load(f)
     except Exception:
         return None
-    same_school = (
-        cache.get("school_code") == cfg.get("school_code")
-        and cache.get("grade") == cfg.get("grade")
-        and cache.get("classnm") == cfg.get("classnm")
-    )
+    if not isinstance(cache, dict):
+        return None
+    same_school = identity(cache) == identity(cfg)
     if cache.get("date") == ymd and same_school:
         return cache
     return None
 
 
 def load_data_cache(cfg=None):
+    """Read only: preview must never fetch or overwrite the shared cache."""
     today = datetime.now().strftime("%Y%m%d")
-    if os.path.exists(DATA_CACHE_PATH):
-        try:
-            with open(DATA_CACHE_PATH, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-            same_school = True
-            if cfg and cfg.get("school_code"):
-                same_school = (
-                    cache.get("school_code") == cfg.get("school_code")
-                    and cache.get("grade") == cfg.get("grade")
-                    and cache.get("classnm") == cfg.get("classnm")
-                )
-            # 오늘 날짜 + 같은 학교/학년/반의 캐시 데이터일 때만 재사용한다
-            if cache.get("date") == today and same_school and (cache.get("timetable") or cache.get("meals")):
-                return cache
-        except Exception:
-            pass
-
-    # 오늘 날짜가 아니거나, 학교가 바뀌었거나, 캐시가 없는데 cfg가 주어졌다면
-    # 실시간으로 오늘 데이터 조회 후 캐싱 (fetch_*가 None을 반환하면 네트워크/API
-    # 실패라는 뜻이므로 빈 값으로 덮어쓰지 않고 []로만 안전하게 처리한다)
-    if cfg and cfg.get("school_code"):
-        try:
-            timetable = fetch_timetable(cfg, today) or []
-            meals = fetch_meal(cfg, today) or []
-            schedule = fetch_school_schedule(cfg, datetime.now()) or []
-            save_data_cache(timetable, meals, today, cfg, schedule)
-            return {"date": today, "timetable": timetable, "meals": meals, "schedule": schedule,
-                    "school_code": cfg.get("school_code"), "grade": cfg.get("grade"), "classnm": cfg.get("classnm")}
-        except Exception as e:
-            print(f"[오늘 데이터 자동 조회 실패] {e}")
-
-    return {"date": today, "timetable": [], "meals": [], "schedule": None}
-
-
-def ensure_autostart():
-    """윈도우 부팅 및 주기적 백그라운드 자동 갱신 등록 (노트북을 계속 켜두어도 자정/교시 변경 시 자동 반영)"""
-    try:
-        # 1. 윈도우 시작 시 자동 실행 레지스트리 등록
-        import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Run",
-            0,
-            winreg.KEY_SET_VALUE
-        )
-        if getattr(sys, "frozen", False):
-            exe_target = sys.executable
-            exe_cmd = f'"{sys.executable}" --background'
-        else:
-            exe_target = sys.executable
-            exe_cmd = f'"{sys.executable}" "{os.path.abspath("app.py")}" --background'
-            
-        winreg.SetValueEx(key, "SchoolWallpaperSync", 0, winreg.REG_SZ, exe_cmd)
-        winreg.CloseKey(key)
-        
-        # 2. 윈도우 작업 스케줄러(Task Scheduler)에 5분 주기 자동 갱신 등록
-        # (노트북이 계속 켜져 있거나 화면이 켜졌을 때 자정 지난 시간표/급식을 자동 갱신)
-        if getattr(sys, "frozen", False):
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            task_cmd = f'schtasks /create /tn "SchoolWallpaperSync" /tr "\\"{exe_target}\\" --background" /sc MINUTE /mo 5 /f'
-            subprocess.run(task_cmd, shell=True, capture_output=True, creationflags=creationflags)
-
-            # 2-1. 절전 모드에서 깨어나는 "그 순간" 바로 반영되도록 별도 이벤트 트리거
-            # 등록. 주기 트리거의 StartWhenAvailable만으로는 "놓친 걸 곧" 실행하는
-            # 정도라 몇 분씩 늦어질 수 있어서, 아침에 노트북을 열자마자 최신 상태이길
-            # 원한다면 이게 핵심이다. Microsoft-Windows-Power-Troubleshooter의
-            # 이벤트 ID 1(절전에서 재개)을 그대로 트리거로 건다.
-            resume_query = (
-                "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] "
-                "and EventID=1]]"
-            )
-            resume_cmd = (
-                f'schtasks /create /tn "SchoolWallpaperSync_OnResume" '
-                f'/tr "\\"{exe_target}\\" --background" '
-                f'/sc ONEVENT /ec System /mo "{resume_query}" /f'
-            )
-            subprocess.run(resume_cmd, shell=True, capture_output=True, creationflags=creationflags)
-
-            # schtasks /create의 기본값은 "배터리로 동작 중이면 시작하지 않음 /
-            # 배터리로 전환되면 중단함" + "놓친 실행은 따라잡지 않음"이라, 노트북이
-            # 충전 중이 아니거나 절전 후 깨어난 직후에는 자동 갱신이 조용히
-            # 멈춰버린다. 매번 재등록될 때마다 PowerShell로 이 설정들을 꺼서
-            # 전원 상태와 무관하게 항상 갱신되도록 강제한다. (두 작업 모두 적용)
-            ps_cmd = (
-                "foreach ($name in @('SchoolWallpaperSync', 'SchoolWallpaperSync_OnResume')) { "
-                "$t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; "
-                "if ($t) { "
-                "$t.Settings.DisallowStartIfOnBatteries = $false; "
-                "$t.Settings.StopIfGoingOnBatteries = $false; "
-                "$t.Settings.StartWhenAvailable = $true; "
-                "Set-ScheduledTask -InputObject $t | Out-Null } }"
-            )
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
-                capture_output=True, creationflags=creationflags,
-            )
-    except Exception as e:
-        print(f"[자동 시작 등록 실패] {e}")
-
+    cfg = cfg or load_config() or {}
+    return read_today_cache_if_matching(cfg, today) or {
+        "date": today, "timetable": [], "meals": [], "schedule": []}
 
 
 # ---------------------------------------------------------------------------
@@ -378,25 +289,8 @@ def load_config():
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-
-def neis_get(endpoint, params):
-    params["KEY"] = API_KEY
-    resp = requests.get(f"{NEIS_BASE}/{endpoint}", params=params, timeout=10)
-    return json.loads(resp.content.decode("utf-8"))
-
-
-def search_school(api_key, name):
-    data = neis_get(
-        "schoolInfo",
-        {"KEY": api_key, "Type": "json", "SCHUL_NM": name, "pSize": 20},
-    )
-    if "schoolInfo" not in data:
-        return []
-    rows = data["schoolInfo"][1]["row"]
-    return rows
+    with desktop_transaction(BASE_DIR):
+        atomic_json(CONFIG_PATH, cfg)
 
 
 def setup_wizard():
@@ -493,133 +387,9 @@ def set_photo_flow():
 # NEIS 데이터 조회
 # ---------------------------------------------------------------------------
 
-def fetch_meal(cfg, ymd):
-    try:
-        data = neis_get(
-            "mealServiceDietInfo",
-            {
-                "KEY": cfg["api_key"],
-                "Type": "json",
-                "ATPT_OFCDC_SC_CODE": cfg["edu_code"],
-                "SD_SCHUL_CODE": cfg["school_code"],
-                "MLSV_YMD": ymd,
-            },
-        )
-        if "mealServiceDietInfo" not in data:
-            return []
-        rows = data["mealServiceDietInfo"][1]["row"]
-        meals = []
-        for r in rows:
-            dishes = r["DDISH_NM"].replace("<br/>", "\n")
-            # 알레르기 표시 괄호 제거 (예: "김치찌개 (5.6.9)")
-            dishes = re.sub(r"\s*\([0-9.]+\)", "", dishes)
-            meals.append({"name": r["MMEAL_SC_NM"], "dishes": dishes})
-        return meals
-    except Exception as e:
-        print(f"[급식 조회 실패] {e}")
-        return None  # 네트워크/API 실패와 "정상 응답이지만 급식이 없음"을 구분한다
-
-
-def fetch_timetable(cfg, ymd):
-    endpoint = SCHOOL_LEVEL_ENDPOINT.get(cfg["school_kind"], "misTimetable")
-    try:
-        data = neis_get(
-            endpoint,
-            {
-                "KEY": cfg["api_key"],
-                "Type": "json",
-                "ATPT_OFCDC_SC_CODE": cfg["edu_code"],
-                "SD_SCHUL_CODE": cfg["school_code"],
-                "GRADE": cfg["grade"],
-                "CLASS_NM": cfg["classnm"],
-                "ALL_TI_YMD": ymd,
-            },
-        )
-        if endpoint not in data:
-            return []
-        rows = data[endpoint][1]["row"]
-        rows.sort(key=lambda r: int(r["PERIO"]))
-        return [{"period": r["PERIO"], "subject": r["ITRT_CNTNT"]} for r in rows]
-    except Exception as e:
-        print(f"[시간표 조회 실패] {e}")
-        return None  # 네트워크/API 실패와 "정상 응답이지만 시간표가 없음"을 구분한다
-
-
-GRADE_EVENT_FLAG = {
-    "1": "ONE_GRADE_EVENT_YN", "2": "TW_GRADE_EVENT_YN", "3": "THREE_GRADE_EVENT_YN",
-    "4": "FR_GRADE_EVENT_YN", "5": "FIV_GRADE_EVENT_YN", "6": "SIX_GRADE_EVENT_YN",
-}
-# 매주 반복되는 토요/일요 휴업일은 "다가오는 학사일정" 으로서 의미가 없어 제외한다
-SCHEDULE_EXCLUDE_NAMES = {"토요휴업일", "일요휴업일"}
-
-
-def fetch_school_schedule(cfg, today, limit=10):
-    """오늘 이후 가까운 학사일정(시험, 방학, 공휴일 등)을 최대 limit개, D-day와 함께
-    가까운 순으로 반환한다. NEIS SchoolSchedule API 사용. 등록된 일정이 없으면 빈 리스트."""
-    ymd = today.strftime("%Y%m%d")
-    to_ymd = (today + timedelta(days=120)).strftime("%Y%m%d")
-    try:
-        data = neis_get(
-            "SchoolSchedule",
-            {
-                "KEY": cfg["api_key"],
-                "Type": "json",
-                "ATPT_OFCDC_SC_CODE": cfg["edu_code"],
-                "SD_SCHUL_CODE": cfg["school_code"],
-                "AA_FROM_YMD": ymd,
-                "AA_TO_YMD": to_ymd,
-            },
-        )
-        if "SchoolSchedule" not in data:
-            return []
-        rows = data["SchoolSchedule"][1]["row"]
-    except Exception as e:
-        print(f"[학사일정 조회 실패] {e}")
-        return None  # 네트워크/API 실패와 "정상 응답이지만 일정이 없음"을 구분한다
-
-    grade_flag = GRADE_EVENT_FLAG.get(str(cfg.get("grade")))
-    candidates = [
-        r for r in rows
-        if r.get("EVENT_NM") not in SCHEDULE_EXCLUDE_NAMES
-        and (not grade_flag or r.get(grade_flag) in ("Y", "*"))
-    ]
-    if not candidates:
-        return []
-
-    candidates.sort(key=lambda r: r["AA_YMD"])
-
-    # 추석/설날처럼 같은 이름의 일정이 연속된 날짜로 여러 줄 등록된 경우, 하나의
-    # 일정으로 묶어서 그 시작일(가장 가까운 D-day) 기준 한 건으로만 취급한다
-    merged = []
-    last_name, last_date = None, None
-    for r in candidates:
-        d = datetime.strptime(r["AA_YMD"], "%Y%m%d").date()
-        if merged and r["EVENT_NM"] == last_name and (d - last_date).days == 1:
-            last_date = d
-            continue
-        merged.append(r)
-        last_name, last_date = r["EVENT_NM"], d
-
-    events = []
-    for r in merged[:limit]:
-        event_date = datetime.strptime(r["AA_YMD"], "%Y%m%d").date()
-        events.append({
-            "name": r["EVENT_NM"],
-            "date": r["AA_YMD"],
-            "dday": (event_date - today.date()).days,
-        })
-    return events
-
-
 # ---------------------------------------------------------------------------
 # 바탕화면 이미지 렌더링
 # ---------------------------------------------------------------------------
-
-def get_screen_size():
-    user32 = ctypes.windll.user32
-    user32.SetProcessDPIAware()
-    return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
-
 
 def font(path, size):
     try:
@@ -726,8 +496,8 @@ def spaced(text):
     return " ".join(list(text))
 
 
-def render_wallpaper(cfg, now, timetable, meals, schedule=None):
-    W, H = get_screen_size()
+def render_wallpaper(cfg, now, timetable, meals, schedule=None, size=None):
+    W, H = size or get_screen_size()
 
     bg = fetch_background(cfg, now, W, H)
     canvas = bg.convert("RGBA")
@@ -967,73 +737,32 @@ def render_wallpaper(cfg, now, timetable, meals, schedule=None):
     return WALLPAPER_PATH
 
 
-def set_wallpaper(path):
-    # Toggling between wallpaper_1.png and wallpaper_2.png to force Windows to refresh the background
-    dir_name = os.path.dirname(path)
-    wp1 = os.path.abspath(os.path.join(dir_name, "wallpaper_1.png"))
-    wp2 = os.path.abspath(os.path.join(dir_name, "wallpaper_2.png"))
-    
-    import winreg
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop")
-        current_wp, _ = winreg.QueryValueEx(key, "Wallpaper")
-        winreg.CloseKey(key)
-        current_wp = os.path.abspath(current_wp)
-    except Exception:
-        current_wp = ""
-        
-    if current_wp.lower() == wp1.lower():
-        target_path = wp2
-    else:
-        target_path = wp1
-        
-    import shutil
-    try:
-        shutil.copy2(path, target_path)
-    except Exception as e:
-        print(f"[오류] 바탕화면 파일 복사 실패: {e}")
-        target_path = path
-        
-    SPI_SETDESKWALLPAPER = 20
-    SPIF_UPDATEINIFILE = 0x01
-    SPIF_SENDCHANGE = 0x02
-    ctypes.windll.user32.SystemParametersInfoW(
-        SPI_SETDESKWALLPAPER, 0, target_path, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
-    )
-
-
 # ---------------------------------------------------------------------------
 # 메인 루프
 # ---------------------------------------------------------------------------
 
 def update_once(cfg):
+    """Fetch a snapshot, then validate identity before committing any side effects."""
+    cfg = deepcopy(cfg)
     now = datetime.now()
     ymd = now.strftime("%Y%m%d")
-    meals = fetch_meal(cfg, ymd)
-    timetable = fetch_timetable(cfg, ymd)
-    schedule = fetch_school_schedule(cfg, now)
-
-    # fetch_*가 None이면 "정상 응답인데 데이터가 없음"이 아니라 와이파이가 잠깐
-    # 끊기는 등 네트워크/API 호출 자체가 실패했다는 뜻이다. 이때 그대로 빈 리스트로
-    # 렌더링하면 방금 전까지 잘 뜨던 시간표/급식이 "시간표 없음"/"급식 없음"으로
-    # 덮어써진다. 오늘 자로 이미 성공해둔 캐시가 있으면 실패한 항목만 그걸로
-    # 대체해서, 일시적인 네트워크 장애가 화면에 그대로 반영되지 않도록 한다.
-    if meals is None or timetable is None or schedule is None:
+    fetched = {"meals": fetch_meal(cfg, ymd),
+               "timetable": fetch_timetable(cfg, ymd),
+               "schedule": fetch_school_schedule(cfg, now)}
+    with desktop_transaction(BASE_DIR):
+        latest = load_config() or cfg
+        if identity(latest) != identity(cfg) or datetime.now().strftime("%Y%m%d") != ymd:
+            return False  # school/date changed while fetching; discard old data
         cached = read_today_cache_if_matching(cfg, ymd)
-        if meals is None:
-            meals = (cached.get("meals") if cached else None) or []
-        if timetable is None:
-            timetable = (cached.get("timetable") if cached else None) or []
-        if schedule is None:
-            schedule = (cached.get("schedule") if cached else None) or []
-        print("[일부 조회 실패 - 오늘자 캐시로 대체했습니다]")
-
-    save_data_cache(timetable, meals, ymd, cfg, schedule) # 로컬 캐시 갱신
-    path = render_wallpaper(cfg, now, timetable, meals, schedule)
-    set_wallpaper(path)
-    ensure_autostart() # 윈도우 시작 시 자동 실행 등록
-    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 바탕화면 갱신 완료 "
-          f"(시간표 {len(timetable)}건, 급식 {len(meals)}건, 학사일정 {len(schedule)}건)")
+        data = resolve_data(fetched, cached)
+        if all(state == 'unavailable' for state in data['states'].values()):
+            raise RuntimeError("데이터 조회 실패: 기존 배경화면을 유지합니다.")
+        save_data_cache(data['timetable'], data['meals'], ymd, cfg, data['schedule'], data['states'])
+        path = render_wallpaper(latest, now, data['timetable'], data['meals'], data['schedule'])
+        set_wallpaper(path)
+    ensure_autostart()
+    print(f"[{ymd}] 갱신 결과: {data['states']}")
+    return True
 
 
 def main():
