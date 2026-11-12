@@ -10,7 +10,6 @@ import main
 from core.editor_state import backup_settings, read_settings_backup, describe_cache
 from core.schoolday import target_day, validate_overrides
 from core.sync import identity
-from ui_widgets import CommandPopup
 
 
 class EditorTools:
@@ -25,31 +24,31 @@ class EditorTools:
         return path
 
     def _build_commands(self):
-        self.command_groups = (
+        bar = self._menu_bar = tk.Menu(self, font=('맑은 고딕', 11))
+        self._menus = {}
+        self.configure(menu=bar)
+        menus = (
             ('파일', [('설정 백업…', self.on_backup, ''), ('설정 복원…', self.on_restore, 'Ctrl+O'),
-                      ('PNG 내보내기…', self.on_export_image, ''), ('도움말', self.on_help, 'F1')]),
+                      ('PNG 내보내기…', self.on_export_image, ''), ('닫기', self.destroy, '')]),
             ('편집', [('실행 취소', self.on_undo, 'Ctrl+Z'), ('다시 실행', self.on_redo, 'Ctrl+Y'),
-                      ('변경 취소', self.on_cancel, ''), ('위치 정렬…', self.on_align, ''),
-                      ('디자인 초기화', self.on_reset, '')]),
-            ('테마', [('저장…', self.on_save_theme, 'Ctrl+S'), ('복제…', self.on_duplicate_theme, ''),
+                      ('변경 취소', self.on_cancel, ''), ('위치 정렬…', self.on_align, '')]),
+            ('테마', [('현재 디자인 저장…', self.on_save_theme, 'Ctrl+S'), ('복제…', self.on_duplicate_theme, ''),
                       ('이름 변경…', self.on_rename_theme, ''), ('삭제', self.on_delete_theme, ''),
                       ('내보내기…', self.on_export_theme, ''), ('가져오기…', self.on_import_theme, '')]),
+            ('도움말', [('단축키와 사용 안내', self.on_help, 'F1')]),
         )
-        self._command_popup = None
-        self.menu_btn = ttk.Button(self.footer, text='메뉴', command=self.on_menu, width=7)
-        self.menu_btn.pack(side='left', before=self.status_label, padx=(0, 12))
+        for label, commands in menus:
+            menu = tk.Menu(bar, tearoff=False, font=('맑은 고딕', 11))
+            self._menus[label] = menu
+            bar.add_cascade(label=label, menu=menu)
+            for text, callback, accelerator in commands:
+                menu.add_command(label=text, command=callback, accelerator=accelerator)
         for key, command in (('<Control-z>', self.on_undo), ('<Control-y>', self.on_redo),
                              ('<Control-s>', self.on_save_theme), ('<Control-o>', self.on_restore),
                              ('<Control-Return>', self.on_apply), ('<F5>', self.on_refresh_data),
-                             ('<F1>', self.on_help), ('<F10>', self.on_menu), ('<Control-0>', self.on_fit)):
+                             ('<F1>', self.on_help), ('<Control-0>', self.on_fit)):
             # Root bindings do not steal shortcuts from independent dialogs.
             self.bind(key, lambda event, action=command: self._shortcut(event, action))
-
-    def on_menu(self):
-        if self._command_popup is not None and self._command_popup.winfo_exists():
-            self._command_popup.destroy()
-        else:
-            self._command_popup = CommandPopup(self, self.menu_btn, self.command_groups)
 
     def _shortcut(self, event, command):
         if event.widget.winfo_toplevel() == self:
@@ -58,8 +57,8 @@ class EditorTools:
 
     def _update_dirty(self):
         dirty = self._collect_draft() != self.cfg
-        self.dirty_var.set('변경됨' if dirty else '')
-        self.title('학교 바탕화면 설정 · v1.4.1' + (' *' if dirty else ''))
+        self.dirty_var.set('적용 전 변경 있음' if dirty else '저장된 설정')
+        self.title('학교 바탕화면' + (' *' if dirty else ''))
 
     def _remember(self):
         self.history.record(self._collect_draft())
@@ -71,7 +70,7 @@ class EditorTools:
         snapshot = self.history.undo()
         if snapshot is not None:
             self._load_widgets(snapshot)
-            self.status_var.set('실행 취소됨')
+            self.status_var.set('이전 편집으로 돌아왔습니다.')
 
     def on_redo(self):
         if self._applying:
@@ -80,14 +79,12 @@ class EditorTools:
         snapshot = self.history.redo()
         if snapshot is not None:
             self._load_widgets(snapshot)
-            self.status_var.set('다시 실행됨')
+            self.status_var.set('편집을 다시 실행했습니다.')
 
     def _chosen_theme(self):
         index = self.theme_combo.current()
         if not 0 <= index < len(self.themes):
-            self.notebook.select(self.tabs['background'])
-            self.theme_combo.focus_set()
-            self.status_var.set('테마를 선택하세요.')
+            messagebox.showinfo('테마 선택', '테마 목록에서 관리할 항목을 선택해주세요.', parent=self)
             return None
         return self.themes[index]
 
@@ -105,7 +102,7 @@ class EditorTools:
             action = self.theme_store.duplicate if duplicate else self.theme_store.rename
             saved = action(item['id'], name)
             self._refresh_themes(saved['name'])
-            self.status_var.set('테마 변경됨')
+            self.status_var.set('테마 목록을 변경했습니다.')
         except (ValueError, OSError) as error:
             messagebox.showerror('테마 변경 실패', str(error), parent=self)
 
@@ -124,7 +121,7 @@ class EditorTools:
         try:
             self.theme_store.delete(item['id'])
             self._refresh_themes()
-            self.status_var.set('테마 삭제됨')
+            self.status_var.set('테마를 삭제했습니다. 편집 중인 디자인은 유지됩니다.')
         except (ValueError, OSError) as error:
             messagebox.showerror('테마 삭제 실패', str(error), parent=self)
 
@@ -137,7 +134,7 @@ class EditorTools:
         if path:
             try:
                 self.theme_store.export_theme(item['id'], self._safe_destination(path))
-                self.status_var.set('테마 내보내기 완료')
+                self.status_var.set('테마를 내보냈습니다. 사용자 사진 파일은 별도로 전달해주세요.')
             except (ValueError, OSError) as error:
                 messagebox.showerror('내보내기 실패', str(error), parent=self)
 
@@ -159,7 +156,7 @@ class EditorTools:
         if path:
             try:
                 backup_settings(self._safe_destination(path), self._collect_draft())
-                self.status_var.set('설정 백업 완료')
+                self.status_var.set('학교·꾸미기·수동 일정을 백업했습니다. API 키·사진 원본·테마 목록은 제외됩니다.')
             except (ValueError, OSError, tk.TclError) as error:
                 messagebox.showerror('백업 실패', str(error), parent=self)
 
@@ -172,7 +169,7 @@ class EditorTools:
                 draft = read_settings_backup(path, self._collect_draft())
                 self._remember()
                 self._load_widgets(draft)
-                self.status_var.set('설정 불러옴 · 적용 전')
+                self.status_var.set('백업을 편집기에 불러왔습니다. 확인 후 적용하세요.')
             except (ValueError, OSError, tk.TclError) as error:
                 messagebox.showerror('복원 실패', str(error), parent=self)
 
@@ -190,7 +187,7 @@ class EditorTools:
         except (ValueError, OSError, tk.TclError) as error:
             messagebox.showerror('내보내기 실패', str(error), parent=self)
             return
-        self.status_var.set('이미지 저장 중…')
+        self.status_var.set('현재 디자인 이미지를 만들고 있습니다…')
 
         def export():
             temporary = None
@@ -218,7 +215,7 @@ class EditorTools:
             return
         self._refreshing = True
         self.refresh_btn.configure(state='disabled')
-        self.status_var.set('조회 중…')
+        self.status_var.set('선택한 날짜의 학교 데이터를 새로 가져오고 있습니다…')
         request = (identity(cfg), target_day(cfg, main.datetime.now()).strftime('%Y%m%d'))
 
         def refresh():
@@ -250,18 +247,11 @@ class EditorTools:
         chunks.append('\n알레르기 번호는 학교가 제공한 원문입니다. 식단 변경·알레르기 관련 사항은 학교 안내를 확인하세요.')
         self._text_dialog('급식 상세', '\n'.join(chunks))
 
-    def on_data_status(self):
-        cfg = self._collect_draft()
-        day = target_day(cfg, main.datetime.now()).strftime('%Y%m%d')
-        status = describe_cache(self._preview_cache(cfg), day).replace('오늘', '선택 날짜')
-        self._text_dialog('조회 상태', status.replace(' · ', '\n'))
-
     def _text_dialog(self, title, content):
         dialog = tk.Toplevel(self)
         dialog.title(title)
-        height = min(600, max(260, (content.count('\n') + 3) * 26), self.winfo_screenheight() - 100)
-        dialog.geometry(f'{min(650, self.winfo_screenwidth() - 80)}x{height}')
-        text = tk.Text(dialog, wrap='word', padx=20, pady=16, font=('맑은 고딕', 12))
+        dialog.geometry('650x530')
+        text = tk.Text(dialog, wrap='word', padx=15, pady=12, font=('맑은 고딕', 11))
         scroll = ttk.Scrollbar(dialog, command=text.yview)
         text.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right', fill='y')
@@ -278,9 +268,10 @@ class EditorTools:
         dialog.title('날짜별 수동 시간표')
         dialog.transient(self)
         dialog.grab_set()
-        ttk.Label(dialog, text='날짜별 시간표 수정').pack(padx=15, pady=12)
+        ttk.Label(dialog, text='같은 날짜·교시의 학교 시간표를 보정합니다. 배경 적용은 메인 창에서 확정하세요.',
+                  wraplength=530).pack(padx=15, pady=10)
         entries = deepcopy(self._collect_draft().get('manual_timetable', []))
-        rows = tk.Listbox(dialog, width=46, height=10, exportselection=False)
+        rows = tk.Listbox(dialog, width=65, height=10, exportselection=False)
         rows.pack(fill='both', expand=True, padx=15)
         row = ttk.Frame(dialog)
         row.pack(padx=15, pady=12)
@@ -343,7 +334,7 @@ class EditorTools:
         labels = {'학교 정보': 'school_info', '시간표': 'timetable', '급식': 'meals', '날짜': 'date_info', '학사일정': 'dday'}
         section = tk.StringVar(value='시간표')
         ttk.Combobox(dialog, values=list(labels), textvariable=section, state='readonly').pack(padx=20, pady=12)
-        ttk.Label(dialog, text='글자의 기준 위치').pack(padx=20, pady=8)
+        ttk.Label(dialog, text='요소의 기준점을 화면 비율에 맞춥니다.\n각 요소의 글자 정렬 방식은 유지됩니다.').pack(padx=20)
         for title, axis, value in (('왼쪽 10%', 'x', 10), ('가로 중앙 50%', 'x', 50), ('오른쪽 90%', 'x', 90),
                                    ('위쪽 10%', 'y', 10), ('세로 중앙 50%', 'y', 50), ('아래쪽 80%', 'y', 80)):
             ttk.Button(dialog, text=title, command=lambda a=axis, v=value: self.align_section(labels[section.get()], a, v)).pack(fill='x', padx=20, pady=3)
@@ -358,14 +349,13 @@ class EditorTools:
         self.trigger_live_apply()
 
     def on_help(self):
-        self._text_dialog('도움말',
-            '편집 → 미리보기 → 적용\n\n'
-            'Ctrl+Z / Y    실행 취소 / 다시 실행\n'
-            'Ctrl+S         테마 저장\n'
-            'Ctrl+Enter   배경 적용\n'
-            'Ctrl+O         설정 복원\n'
-            'Ctrl+0         화면에 맞춤\n'
-            'F5                새로고침\n\n'
-            '테마는 디자인만, 설정 백업은 학교·일정도 저장합니다.\n'
-            'API 키·사진 원본·테마 목록은 백업에 포함되지 않습니다.\n'
-            '조회 상태는 학교 탭에서 확인할 수 있습니다.')
+        self._text_dialog('사용 안내 · 단축키',
+            '편집 → 미리보기 확인 → 저장 및 지금 적용 순서로 사용하세요.\n\n'
+            'Ctrl+Z / Ctrl+Y : 실행 취소 / 다시 실행 (최근 60개 상태)\n'
+            'Ctrl+S : 현재 디자인을 테마로 저장\nCtrl+Enter : 저장 및 배경 적용\n'
+            'Ctrl+O : 설정 백업 불러오기\nCtrl+0 : 미리보기 화면에 맞춤\nF5 : 학교 데이터 새로고침\nF1 : 이 안내\n\n'
+            '확대 보기에서는 스크롤 막대로 이동합니다. 격자와 저장본 비교는 실제 배경·내보낸 PNG에 포함되지 않습니다.\n\n'
+            '오늘/내일 선택은 시간표·급식·날짜 표시에 적용됩니다. D-Day 계산은 실제 오늘 기준입니다. '
+            '수동 시간표는 지정 날짜의 교시를 덮어씁니다. 학교·학급을 바꾸면 이전 수동 보정은 비워집니다.\n\n'
+            '테마에는 꾸미기만 저장됩니다. 설정 백업에는 학교와 수동 일정도 포함되며 API 키는 제외됩니다. '
+            '사용자 사진 원본과 저장한 테마 목록은 별도로 보관해주세요.')

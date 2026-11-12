@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 
 echo Building SchoolWallpaperSettings.exe...
-python -m PyInstaller --onefile --windowed --name "SchoolWallpaperSettings" --icon="icon.ico" --additional-hooks-dir hooks --add-data "fonts;fonts" --add-data "KOPUBWORLD_OTF_FONTS2026;KOPUBWORLD_OTF_FONTS2026" --exclude-module numpy --noconfirm app.py
+python -m PyInstaller --onefile --windowed --name "SchoolWallpaperSettings" --icon="icon.ico" --add-data "icon.ico;." --additional-hooks-dir hooks --add-data "fonts;fonts" --add-data "KOPUBWORLD_OTF_FONTS2026;KOPUBWORLD_OTF_FONTS2026" --exclude-module numpy --noconfirm app.py
 if errorlevel 1 exit /b 1
 
 echo Moving executable...

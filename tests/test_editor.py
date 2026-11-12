@@ -204,7 +204,8 @@ class EditorTests(unittest.TestCase):
         self.app._on_preview_resize()
         self.app.update_idletasks()
         self.assertEqual((self.app.winfo_width(), self.app.winfo_height()), (width, height))
-        for name in ('theme_combo', 'save_theme_btn', 'apply_btn', 'cancel_btn', 'menu_btn', 'preview_area', 'preview_label'):
+        for name in ('theme_combo', 'save_theme_btn', 'apply_btn', 'cancel_btn', 'preview_area', 'preview_label',
+                     'refresh_btn', 'meal_btn', 'timetable_btn'):
             widget = getattr(self.app, name)
             # Canvas.winfo_rootx() is zero until a native window is mapped. Its
             # geometry and parent allocations are still available without mapping.
@@ -224,7 +225,7 @@ class EditorTests(unittest.TestCase):
                 self.assertLessEqual(bottom, height)
         self.assertLessEqual(self.app.preview_note.winfo_reqwidth(), self.app.preview_note.winfo_width(),
                              'Preview help text is wider than its allocated label')
-        self.assertIn('v1.4', self.app.title())
+        self.assertEqual(self.app.title(), '학교 바탕화면')
 
     def test_layout_default_size(self):
         self.check_layout(1200, 780)
@@ -430,23 +431,106 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(self.app._collect_draft(), original)
         self.assert_saved_unchanged()
 
-    def test_large_command_menu_keeps_export_action_reachable(self):
+    def test_original_native_menu_has_readable_font_and_working_export(self):
         from tkinter import font
-        from ui_widgets import CommandPopup
-        with patch.object(CommandPopup, 'deiconify'), patch.object(CommandPopup, 'grab_set'):
-            self.app.on_menu()
-        menu = self.app._command_popup
-        self.app.update_idletasks()
-        self.assertLessEqual(menu.winfo_reqheight(), 600)
-        self.assertLessEqual(menu.winfo_reqwidth(), 1000)
-        for button in menu.buttons:
-            configured = settings_gui.ttk.Style(self.app).lookup(button.cget('style'), 'font')
-            self.assertGreaterEqual(font.Font(root=self.app, font=configured).actual('size'), 13)
-        export = next(button for button in menu.buttons if button.cget('text') == 'PNG 내보내기…')
+        self.assertIsInstance(self.app._menu_bar, tk.Menu)
+        self.assertEqual(set(self.app._menus), {'파일', '편집', '테마', '도움말'})
+        for menu in self.app._menus.values():
+            self.assertIsInstance(menu, tk.Menu)
+            self.assertGreaterEqual(font.Font(root=self.app, font=menu.cget('font')).actual('size'), 11)
         with patch.object(settings_gui.filedialog, 'asksaveasfilename', return_value='') as choose:
-            export.invoke()
+            self.app._menus['파일'].invoke(2)
             choose.assert_called_once()
-        self.assertFalse(menu.winfo_exists())
+        self.assert_saved_unchanged()
+
+    def test_color_palettes_change_only_colors_and_preserve_school_search(self):
+        self.app.photo_mode.set('preset')
+        self.app.preset_combo.current(2)
+        self.app.sec_vars['school_info']['x'].set(31)
+        self.app.selected_school = {
+            'ATPT_OFCDC_SC_CODE': self.cfg['edu_code'], 'SD_SCHUL_CODE': self.cfg['school_code'],
+            'SCHUL_NM': self.cfg['school_name'], 'SCHUL_KND_SC_NM': self.cfg['school_kind'],
+        }
+        selection = self.app.selected_school
+        self.app.result_list.insert('end', '검색 결과 유지')
+        original = self.app._collect_draft()
+        self.assertEqual(len(self.app.color_palettes), 6)
+        for palette in self.app.color_palettes:
+            with self.subTest(palette=palette['name']):
+                self.app.palette_buttons[palette['id']].invoke()
+                expected = deepcopy(original)
+                expected['font_colors'] = palette['colors']
+                self.assertEqual(self.app._collect_draft(), expected)
+                self.assertIs(self.app.selected_school, selection)
+                self.assertEqual(self.app.result_list.get(0), '검색 결과 유지')
+                for key, color in palette['colors'].items():
+                    self.assertEqual(self.app.color_buttons[key].cget('background'), color)
+        self.settle_preview()
+        self.assertEqual(self.compose.call_args.args[0]['font_colors'], expected['font_colors'])
+        self.apply.assert_not_called()
+        self.assert_saved_unchanged()
+
+    def test_color_palette_undo_redo_is_one_step_even_before_preview_finishes(self):
+        original = self.app._collect_draft()
+        self.app.palette_buttons['ocean'].invoke()
+        ocean = self.app._collect_draft()
+        self.app.palette_buttons['mint'].invoke()
+        mint = self.app._collect_draft()
+        self.app.on_undo()
+        self.assertEqual(self.app._collect_draft(), ocean)
+        self.app.on_redo()
+        self.assertEqual(self.app._collect_draft(), mint)
+        self.app.on_undo()
+        self.app.on_undo()
+        self.assertEqual(self.app._collect_draft(), original)
+        self.assert_saved_unchanged()
+
+    def test_group_color_changes_only_selected_text_and_cancel_is_noop(self):
+        original = self.app._collect_draft()
+        # Explicit expectations protect the group boundaries, not just the widgets.
+        body = {'school_name_muted', 'timetable_subject', 'meals_dish', 'dday_name'}
+        all_keys = set(original['font_colors'])
+        for group, keys in (('body', body), ('accent', all_keys - body), ('all', all_keys)):
+            with self.subTest(group=group), patch.object(settings_gui.colorchooser, 'askcolor',
+                                                       return_value=((18, 52, 86), '#123456')):
+                self.app.group_color_buttons[group].invoke()
+                expected = deepcopy(original)
+                expected['font_colors'].update(dict.fromkeys(keys, '#123456'))
+                self.assertEqual(self.app._collect_draft(), expected)
+                self.app.on_undo()
+                self.assertEqual(self.app._collect_draft(), original)
+        undo_available = self.app.history.can_undo
+        with patch.object(settings_gui.colorchooser, 'askcolor', return_value=(None, None)):
+            self.app.group_color_buttons['all'].invoke()
+        self.assertEqual(self.app._collect_draft(), original)
+        self.assertEqual(self.app.history.can_undo, undo_available)
+        self.assert_saved_unchanged()
+
+    def test_color_reset_preserves_other_edits_and_can_be_undone(self):
+        self.app.palette_buttons['lavender'].invoke()
+        self.app.sec_vars['timetable']['x'].set(24)
+        self.app.photo_mode.set('preset')
+        before = self.app._collect_draft()
+        self.app.reset_colors_btn.invoke()
+        expected = deepcopy(before)
+        expected['font_colors'] = main.DEFAULT_COLORS
+        self.assertEqual(self.app._collect_draft(), expected)
+        self.app.on_undo()
+        self.assertEqual(self.app._collect_draft(), before)
+        self.assert_saved_unchanged()
+
+    def test_color_tools_do_not_change_draft_during_apply(self):
+        original = self.app._collect_draft()
+        self.app._applying = True
+        try:
+            with patch.object(settings_gui.colorchooser, 'askcolor') as choose:
+                self.app.group_color_buttons['all'].invoke()
+                choose.assert_not_called()
+            self.app.palette_buttons['sunset'].invoke()
+            self.app.reset_colors_btn.invoke()
+            self.assertEqual(self.app._collect_draft(), original)
+        finally:
+            self.app._applying = False
         self.assert_saved_unchanged()
 
     def test_alignment_changes_only_target_section_and_is_undoable(self):
@@ -459,6 +543,132 @@ class EditorTests(unittest.TestCase):
             self.assertEqual(edited['sections'][section], original['sections'][section])
         self.app.on_undo()
         self.assertEqual(self.app._collect_draft()['sections'], original['sections'])
+        self.assert_saved_unchanged()
+
+    def test_quick_class_change_clears_overrides_and_undo_restores_them(self):
+        self.app.manual_timetable = [{'date': '20990101', 'period': '1', 'subject': '직접 입력'}]
+        before = self.app._collect_draft()
+        self.app.basic_tool_buttons['next_class'].invoke()
+        expected = deepcopy(before)
+        expected.update(classnm='5', manual_timetable=[])
+        self.assertEqual(self.app._collect_draft(), expected)
+        self.assertIn('수동 시간표 초기화', self.app.status_var.get())
+        self.app.on_undo()
+        self.assertEqual(self.app._collect_draft(), before)
+        self.settle_preview()
+        self.assertEqual(self.app._collect_draft(), before)
+        self.app.on_redo()
+        self.assertEqual(self.app._collect_draft(), expected)
+        self.app.basic_tool_buttons['restore_class'].invoke()
+        self.assertEqual(self.app.class_var.get(), self.cfg['classnm'])
+        self.assertEqual(self.app.grade_var.get(), self.cfg['grade'])
+        self.assert_saved_unchanged()
+
+    def test_quick_class_controls_handle_empty_invalid_and_lower_bound(self):
+        for text, direction, expected in (('', 1, '1'), ('1', -1, '1'), ('2', -1, '1')):
+            with self.subTest(text=text):
+                self.app.class_var.set(text)
+                self.app.on_step_class(direction)
+                self.assertEqual(self.app.class_var.get(), expected)
+        self.app.class_var.set('잘못된 입력')
+        before = self.app._collect_draft()
+        self.app.on_step_class(1)
+        self.assertEqual(self.app._collect_draft(), before)
+        self.assertIn('숫자', self.app.status_var.get())
+        self.assert_saved_unchanged()
+
+    def test_quick_background_navigation_wraps_and_undo_preserves_photo(self):
+        from unittest.mock import Mock
+        from datetime import datetime
+        self.app.photo_mode.set('custom')
+        self.app.photo_path.set(str(self.directory / 'my-photo.png'))
+        self.app.preset_combo.current(7)
+        before = self.app._collect_draft()
+        self.app.basic_tool_buttons['next_photo'].invoke()
+        expected = deepcopy(before)
+        expected.update(bg_photo_mode='preset', bg_photo_idx=0)
+        self.assertEqual(self.app._collect_draft(), expected)
+        self.assertEqual(str(self.app.preset_combo.cget('state')), 'readonly')
+        self.app.on_undo()
+        self.assertEqual(self.app._collect_draft(), before)
+        self.assertEqual(str(self.app.photo_entry.cget('state')), 'readonly')
+        self.app.photo_mode.set('auto')
+        fixed = datetime(2026, 11, 12)
+        with patch.object(main, 'datetime', Mock(now=lambda: fixed)):
+            self.app.on_step_photo(-1)
+        self.assertEqual(self.app.preset_combo.current(), (fixed.timetuple().tm_yday - 1) % 8)
+        self.assert_saved_unchanged()
+
+    def test_quick_background_restore_changes_only_background_fields(self):
+        self.app.basic_tool_buttons['next_photo'].invoke()
+        self.app.colors_vars['school_name'].set('#123456')
+        before = self.app._collect_draft()
+        self.app.basic_tool_buttons['restore_photo'].invoke()
+        expected = deepcopy(before)
+        for key in ('bg_photo_mode', 'bg_photo_idx', 'custom_background'):
+            expected[key] = self.cfg[key]
+        self.assertEqual(self.app._collect_draft(), expected)
+        self.app.on_undo()
+        self.assertEqual(self.app._collect_draft(), before)
+        self.assert_saved_unchanged()
+
+    def test_quick_section_positions_affect_only_that_axis_and_are_undoable(self):
+        before = self.app._collect_draft()
+        for button, axis, value in (('left', 'x', 10), ('center_x', 'x', 50), ('right', 'x', 90),
+                                     ('top', 'y', 10), ('center_y', 'y', 50), ('bottom', 'y', 80)):
+            with self.subTest(button=button):
+                self.app.section_tool_buttons['meals'][button].invoke()
+                expected = deepcopy(before)
+                expected['sections']['meals'][axis] = value
+                self.assertEqual(self.app._collect_draft(), expected)
+                self.assertEqual(self.app.label_vars['meals'][axis].get(), str(value))
+                if expected != before:
+                    self.app.on_undo()
+                    self.assertEqual(self.app._collect_draft(), before)
+        self.assert_saved_unchanged()
+
+    def test_quick_effects_follow_sync_toggle_and_undo_as_one_step(self):
+        before = self.app._collect_draft()
+        for together in (False, True):
+            with self.subTest(together=together):
+                self.app.sync_effects.set(together)
+                self.app.section_tool_buttons['timetable']['clear'].invoke()
+                expected = deepcopy(before)
+                targets = tuple(before['sections']) if together else ('timetable',)
+                for target in targets:
+                    expected['sections'][target].update(stroke_width=2, shadow_blur=3, shadow_opacity=180)
+                    self.assertEqual(self.app.label_vars[target]['stroke_width'].get(), '2')
+                self.assertEqual(self.app._collect_draft(), expected)
+                self.settle_preview()
+                self.app.on_undo()
+                self.assertEqual(self.app._collect_draft(), before)
+        self.assert_saved_unchanged()
+
+    def test_quick_font_size_stays_in_slider_range(self):
+        before = self.app._collect_draft()
+        for initial, action, expected in ((50, 'smaller', 50), (55, 'smaller', 50),
+                                           (195, 'larger', 200), (200, 'larger', 200),
+                                           (175, 'normal_size', 100)):
+            with self.subTest(initial=initial, action=action):
+                self.app.sec_vars['school_info']['font_size'].set(initial)
+                self.app.section_tool_buttons['school_info'][action].invoke()
+                self.assertEqual(self.app.sec_vars['school_info']['font_size'].get(), expected)
+                for section in ('timetable', 'meals', 'date_info', 'dday'):
+                    self.assertEqual(self.app._collect_draft()['sections'][section], before['sections'][section])
+        self.assert_saved_unchanged()
+
+    def test_new_quick_tools_leave_draft_unchanged_during_apply(self):
+        before = self.app._collect_draft()
+        self.app._applying = True
+        try:
+            for button in self.app.basic_tool_buttons.values():
+                button.invoke()
+            for section in self.app.section_tool_buttons.values():
+                for button in section.values():
+                    button.invoke()
+            self.assertEqual(self.app._collect_draft(), before)
+        finally:
+            self.app._applying = False
         self.assert_saved_unchanged()
 
     def descendants(self, widget):

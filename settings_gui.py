@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-학교 바탕화면 v1.4.1 편집기.
+학교 바탕화면 v1.4 편집기.
 편집과 테마 선택은 창 안 미리보기에만 반영하고 명시적으로 적용한다.
 """
 
@@ -12,15 +12,16 @@ import threading
 import queue
 from PIL import Image, ImageTk, ImageDraw
 from editor_tools import EditorTools
-from core.editor_state import EditHistory, describe_cache
+from editor_shortcuts import EditorShortcuts
+from core.editor_state import EditHistory
+from core.palettes import COLOR_GROUPS, color_palettes
 from core.schoolday import target_day, validate_overrides
-from core.themes import ThemeStore, apply_style, extract_style
+from core.themes import ThemeStore, apply_style, extract_style, validate_style
 from copy import deepcopy
 from core.latest import LatestWorker
 from core.sync import identity
 from core.storage import desktop_transaction
 import tkinter as tk
-from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, ttk, colorchooser, simpledialog
 
 import requests
@@ -55,7 +56,7 @@ def search_school(name):
     return main.search_school(cfg.get("api_key", main.API_KEY), name)
 
 
-class App(EditorTools, tk.Tk):
+class App(EditorTools, EditorShortcuts, tk.Tk):
     def __init__(self):
         super().__init__()
         # 위젯을 다 만들기 전에는 창을 화면에 보여주지 않는다. (슬라이더/색상 버튼
@@ -63,27 +64,22 @@ class App(EditorTools, tk.Tk):
         # 창을 먼저 크게 띄웠다가 첫 클릭(리드로우) 시점에야 지정한 크기로 줄어드는
         # 현상이 있었다 — 완성된 뒤에 크기를 다시 맞추고 그때 보여주면 이 깜빡임이 없다)
         self.withdraw()
-        self.title("학교 바탕화면 설정 · v1.4.1")
+        self.title("학교 바탕화면")
         self.resizable(True, True)
         # 창 크기 조정 (Y축 길이를 늘려 저장/초기화/닫기 버튼이 시원하게 보이도록 여백 확보)
         self.geometry("1200x760")
         try:
-            icon_path = os.path.join(main.ROOT_DIR, "icon.ico")
+            icon_path = os.path.join(getattr(sys, '_MEIPASS', main.ROOT_DIR), "icon.ico")
             if os.path.exists(icon_path):
                 self.iconbitmap(icon_path)
         except Exception:
             pass
 
-        for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont'):
-            tkfont.nametofont(name).configure(family='맑은 고딕', size=12)
-        self.option_add('*TCombobox*Listbox.font', ('맑은 고딕', 12))
+        # ttk 스타일 설정 (전체적으로 글자 크기를 11pt로 시원하게 확대)
         style = ttk.Style()
-        style.configure('.', font=('맑은 고딕', 12))
-        style.configure('TButton', padding=(12, 7))
-        style.configure('TNotebook.Tab', font=('맑은 고딕', 12), padding=(12, 8))
-        style.configure('TLabelframe.Label', font=('맑은 고딕', 12, 'bold'))
-        style.configure('Command.TButton', font=('맑은 고딕', 13), padding=(14, 9), anchor='w', width=12)
-        style.configure('MenuHeading.TLabel', font=('맑은 고딕', 13, 'bold'))
+        style.configure(".", font=("맑은 고딕", 11))
+        style.configure("TNotebook.Tab", font=("맑은 고딕", 11, "bold"))
+        style.configure("TLabelframe.Label", font=("맑은 고딕", 11, "bold"))
 
         self.cfg = load_config()
         if not self.cfg:
@@ -112,36 +108,53 @@ class App(EditorTools, tk.Tk):
         # 창을 열자마자 원치 않는 실시간 적용이 발생하는 것을 막는 플래그
         self._initializing = True
 
-        self.day_var = tk.StringVar(value=self.cfg.get('display_day', 'today'))
-        self.dirty_var = tk.StringVar(value='')
-        self.footer = ttk.Frame(self)
-        self.footer.pack(side='bottom', fill='x', padx=16, pady=12)
         self.body = ttk.Frame(self)
-        self.body.pack(fill="both", expand=True, padx=16, pady=(16, 0))
-        editor = ttk.Frame(self.body, width=510)
+        self.body.pack(fill="both", expand=True, padx=10, pady=8)
+        editor = ttk.Frame(self.body, width=580)
         editor.pack(side="left", fill="both")
         editor.pack_propagate(False)
-        self.preview_area = ttk.LabelFrame(self.body, text=" 미리보기 ")
-        self.preview_area.pack(side="left", fill="both", expand=True, padx=(16, 0))
-        self.preview_note = ttk.Label(self.preview_area, text='', wraplength=400)
-        self.preview_note.pack(fill="x", padx=14, pady=(10, 0))
+        # 탭 레이아웃 구성
+        toolbar = ttk.Frame(editor)
+        toolbar.pack(side="bottom", fill="x", padx=8, pady=(8, 4))
+        ttk.Label(toolbar, text="테마", font=("맑은 고딕", 11, "bold")).pack(side="left")
+        self.theme_combo = ttk.Combobox(toolbar, state="readonly", width=26)
+        self.theme_combo.pack(side="left", padx=8)
+        self.theme_combo.bind("<<ComboboxSelected>>", self.on_theme_selected)
+        self.save_theme_btn = ttk.Button(toolbar, text="현재 디자인 저장", command=self.on_save_theme)
+        self.save_theme_btn.pack(side="left")
+        utility = ttk.Frame(editor)
+        utility.pack(side='bottom', fill='x', padx=8, pady=4)
+        self.day_var = tk.StringVar(value=self.cfg.get('display_day', 'today'))
+        for title, value in (('오늘', 'today'), ('내일', 'tomorrow')):
+            ttk.Radiobutton(utility, text=title, value=value, variable=self.day_var).pack(side='left', padx=3)
+        self.refresh_btn = ttk.Button(utility, text='데이터 새로고침 (F5)', command=self.on_refresh_data)
+        self.refresh_btn.pack(side='left', padx=6)
+        self.meal_btn = ttk.Button(utility, text='급식 상세', command=self.on_meal_details)
+        self.meal_btn.pack(side='left', padx=3)
+        self.timetable_btn = ttk.Button(utility, text='수동 시간표', command=self.on_manual_timetable)
+        self.timetable_btn.pack(side='left', padx=3)
+        self.dirty_var = tk.StringVar(value='저장된 설정')
+        self.preview_area = ttk.LabelFrame(self.body, text=" 적용 전 미리보기 ")
+        self.preview_area.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        self.preview_note = ttk.Label(self.preview_area, text='', wraplength=470)
+        self.preview_note.pack(side="bottom", fill="x", padx=12, pady=(4, 8))
         controls = ttk.Frame(self.preview_area)
-        controls.pack(side='bottom', fill='x', padx=12, pady=(4, 12))
+        controls.pack(side='bottom', fill='x', padx=10, pady=(4, 2))
         self.zoom_var = tk.StringVar(value='화면에 맞춤')
         self.grid_var = tk.BooleanVar(value=False)
         self.compare_var = tk.BooleanVar(value=False)
         ttk.Combobox(controls, textvariable=self.zoom_var, values=['화면에 맞춤', '100%', '150%'],
-                     state='readonly', width=11).pack(side='left')
+                     state='readonly', width=12).pack(side='left')
         ttk.Checkbutton(controls, text='격자', variable=self.grid_var).pack(side='left', padx=4)
-        ttk.Checkbutton(controls, text='저장본', variable=self.compare_var).pack(side='left')
+        ttk.Checkbutton(controls, text='저장본 보기', variable=self.compare_var).pack(side='left')
         surface = ttk.Frame(self.preview_area)
         surface.pack(fill='both', expand=True, padx=10, pady=8)
         surface.rowconfigure(0, weight=1)
         surface.columnconfigure(0, weight=1)
         self.preview_label = tk.Canvas(surface, background='#20252c', highlightthickness=0, width=100, height=100)
         self.preview_label.grid(row=0, column=0, sticky='nsew')
-        horizontal = self.preview_scroll_x = ttk.Scrollbar(surface, orient='horizontal', command=self.preview_label.xview)
-        vertical = self.preview_scroll_y = ttk.Scrollbar(surface, orient='vertical', command=self.preview_label.yview)
+        horizontal = ttk.Scrollbar(surface, orient='horizontal', command=self.preview_label.xview)
+        vertical = ttk.Scrollbar(surface, orient='vertical', command=self.preview_label.yview)
         horizontal.grid(row=1, column=0, sticky='ew')
         vertical.grid(row=0, column=1, sticky='ns')
         self.preview_label.configure(xscrollcommand=horizontal.set, yscrollcommand=vertical.set)
@@ -152,41 +165,36 @@ class App(EditorTools, tk.Tk):
         tab_basic = ttk.Frame(notebook)
         tab_colors = ttk.Frame(notebook)
         tab_design = ttk.Frame(notebook)
-        tab_school = ttk.Frame(notebook)
-        self.tabs = dict(background=tab_basic, colors=tab_colors, layout=tab_design, school=tab_school)
+        self.tabs = dict(basic=tab_basic, colors=tab_colors, layout=tab_design)
 
-        notebook.add(tab_basic, text='배경')
-        notebook.add(tab_colors, text='색상')
-        notebook.add(tab_design, text='배치')
-        notebook.add(tab_school, text='학교')
-
-        ttk.Label(tab_basic, text='테마', font=('맑은 고딕', 12, 'bold')).pack(anchor='w', padx=16, pady=(20, 10))
-        toolbar = ttk.Frame(tab_basic)
-        toolbar.pack(fill='x', padx=16, pady=(0, 24))
-        self.theme_combo = ttk.Combobox(toolbar, state='readonly', width=18)
-        self.theme_combo.pack(side='left', fill='x', expand=True, padx=(0, 10))
-        self.theme_combo.bind('<<ComboboxSelected>>', self.on_theme_selected)
-        self.save_theme_btn = ttk.Button(toolbar, text='저장', command=self.on_save_theme, width=6)
-        self.save_theme_btn.pack(side='right')
+        notebook.add(tab_basic, text=" 기본 설정 ")
+        notebook.add(tab_colors, text=" 글자 색상 설정 ")
+        notebook.add(tab_design, text=" 배치 및 효과 설정 ")
 
         pad = {"padx": 15, "pady": 4}
 
         # ----------------------------------------------------
         # Tab 1: 기본 설정 (학교/학급 + 배경 사진 통합)
         # ----------------------------------------------------
-        ttk.Label(tab_school, text="학교", font=("맑은 고딕", 12, "bold")).pack(anchor="w", padx=16, pady=(20, 10))
-        search_row = ttk.Frame(tab_school)
+        basic_container, basic_content = self.make_scrollable_tab(tab_basic)
+        basic_container.pack(fill='both', expand=True)
+        ttk.Label(basic_content, text="학교 이름", font=("맑은 고딕", 11, "bold")).pack(anchor="w", **pad)
+        search_row = ttk.Frame(basic_content)
         search_row.pack(anchor="w", padx=15, fill="x")
         self.school_name_var = tk.StringVar(value=self.cfg.get("school_name", ""))
-        ttk.Entry(search_row, textvariable=self.school_name_var, width=20).pack(side="left", fill='x', expand=True)
+        ttk.Entry(search_row, textvariable=self.school_name_var, width=38).pack(side="left")
         self.search_btn = ttk.Button(search_row, text="검색", command=self.on_search)
         self.search_btn.pack(side="left", padx=6)
 
-        self.result_list = tk.Listbox(tab_school, height=4, width=26, font=("맑은 고딕", 12))
+        self.result_list = tk.Listbox(basic_content, height=4, width=54, font=("맑은 고딕", 11))
+        self.result_list.pack(anchor="w", padx=15, pady=4)
         self.result_list.bind("<<ListboxSelect>>", self.on_result_select)
 
         self.selected_school_var = tk.StringVar(value=self._selected_school_label())
-        gc_row = self.school_class_row = ttk.Frame(tab_school)
+        ttk.Label(basic_content, textvariable=self.selected_school_var, foreground="#1a5fb4",
+                  font=("맑은 고딕", 10, "bold")).pack(anchor="w", padx=15, pady=(0, 4))
+
+        gc_row = ttk.Frame(basic_content)
         gc_row.pack(anchor="w", padx=15, pady=4, fill="x")
         ttk.Label(gc_row, text="학년").pack(side="left")
         self.grade_var = tk.StringVar(value=self.cfg.get("grade", ""))
@@ -195,62 +203,46 @@ class App(EditorTools, tk.Tk):
         self.class_var = tk.StringVar(value=self.cfg.get("classnm", ""))
         ttk.Entry(gc_row, textvariable=self.class_var, width=6).pack(side="left", padx=4)
 
-        ttk.Separator(tab_school).pack(fill='x', padx=16, pady=24)
-        utility = ttk.Frame(tab_school)
-        utility.pack(fill='x', padx=16)
-        for title, value in (('오늘', 'today'), ('내일', 'tomorrow')):
-            ttk.Radiobutton(utility, text=title, value=value, variable=self.day_var).pack(side='left', padx=(0, 12))
-        self.refresh_btn = ttk.Button(utility, text='새로고침', command=self.on_refresh_data)
-        self.refresh_btn.pack(side='right')
-        details = ttk.Frame(tab_school)
-        details.pack(fill='x', padx=16, pady=16)
-        ttk.Button(details, text='급식 상세', command=self.on_meal_details).pack(side='left', padx=(0, 10))
-        ttk.Button(details, text='수동 시간표', command=self.on_manual_timetable).pack(side='left')
-        ttk.Button(tab_school, text='조회 상태', command=self.on_data_status).pack(anchor='w', padx=16)
-
         # 구분선 추가
-        ttk.Label(tab_basic, text="사진", font=("맑은 고딕", 12, "bold")).pack(anchor="w", padx=16, pady=(0, 12))
+        ttk.Separator(basic_content, orient="horizontal").pack(fill="x", padx=15, pady=8)
+
+        ttk.Label(basic_content, text="배경 사진", font=("맑은 고딕", 11, "bold")).pack(anchor="w", **pad)
         
         self.photo_mode = tk.StringVar(value=self.cfg.get("bg_photo_mode", "auto"))
         
-        ttk.Radiobutton(tab_basic, text="매일 바꾸기", value="auto",
+        ttk.Radiobutton(basic_content, text="자동으로 매일 바꾸기", value="auto",
                          variable=self.photo_mode, command=self.update_bg_ui_state).pack(anchor="w", padx=15, pady=2)
                          
-        ttk.Radiobutton(tab_basic, text="기본 사진", value="preset",
+        ttk.Radiobutton(basic_content, text="기본 사진 고정", value="preset",
                          variable=self.photo_mode, command=self.update_bg_ui_state).pack(anchor="w", padx=15, pady=2)
                          
-        preset_row = ttk.Frame(tab_basic)
+        preset_row = ttk.Frame(basic_content)
         preset_row.pack(anchor="w", padx=30, pady=2, fill="x")
-        self.preset_row = preset_row
-        self.preset_combo = ttk.Combobox(preset_row, values=BACKGROUND_PHOTOS, state="readonly", width=22)
-        self.preset_combo.pack(fill='x')
+        self.preset_combo = ttk.Combobox(preset_row, values=BACKGROUND_PHOTOS, state="readonly", width=34)
+        self.preset_combo.pack(side="left")
         initial_idx = self.cfg.get("bg_photo_idx", 0)
         self.preset_combo.current(initial_idx if 0 <= initial_idx < 8 else 0)
         
-        self.custom_radio = ttk.Radiobutton(tab_basic, text="내 사진", value="custom",
-                         variable=self.photo_mode, command=self.update_bg_ui_state)
-        self.custom_radio.pack(anchor="w", padx=15, pady=2)
+        ttk.Radiobutton(basic_content, text="내 사진 선택", value="custom",
+                         variable=self.photo_mode, command=self.update_bg_ui_state).pack(anchor="w", padx=15, pady=2)
                          
-        photo_row = ttk.Frame(tab_basic)
+        photo_row = ttk.Frame(basic_content)
         photo_row.pack(anchor="w", padx=30, pady=2, fill="x")
         self.photo_path = tk.StringVar(value=self.cfg.get("custom_background") or "")
-        self.photo_row = photo_row
-        self.photo_entry = ttk.Entry(photo_row, textvariable=self.photo_path, width=16, state="readonly")
-        self.photo_entry.pack(side="left", fill='x', expand=True)
-        self.photo_browse_btn = ttk.Button(photo_row, text="찾기", command=self.on_browse_photo, width=5)
+        self.photo_entry = ttk.Entry(photo_row, textvariable=self.photo_path, width=36, state="readonly")
+        self.photo_entry.pack(side="left")
+        self.photo_browse_btn = ttk.Button(photo_row, text="찾아보기...", command=self.on_browse_photo)
         self.photo_browse_btn.pack(side="left", padx=6)
         
         self.update_bg_ui_state()
+        self._build_basic_tools(basic_content)
 
         # ----------------------------------------------------
         # Tab 2: 글자 색상 설정
         # ----------------------------------------------------
-        color_frame = ttk.Frame(tab_colors)
-        color_frame.pack(fill='both', expand=True, padx=12, pady=16)
-        for row in range(6):
-            color_frame.rowconfigure(row, weight=1)
-        for column in (0, 2):
-            color_frame.columnconfigure(column, weight=1)
+        color_container, color_content = self.make_scrollable_tab(tab_colors)
+        color_container.pack(fill='both', expand=True)
+        color_frame = self._tool_group(color_content, '요소별 글자 색상 설정')
         
         self.colors_vars = {}
         self.color_buttons = {}
@@ -264,17 +256,18 @@ class App(EditorTools, tk.Tk):
             return True
             
         def make_color_btn(parent, label_text, key, val, r, c):
-            ttk.Label(parent, text=label_text).grid(row=r, column=c*2, sticky="w", padx=6, pady=8)
+            cell = self._tool_cell(parent, r, c)
+            ttk.Label(cell, text=label_text, font=("맑은 고딕", 11)).grid(row=0, column=0, sticky="w")
             color_var = tk.StringVar(value=val)
             self.colors_vars[key] = color_var
             
-            btn = tk.Button(parent, text='', width=8, relief="groove", bd=1, font=("Consolas", 11), pady=7)
-            btn.grid(row=r, column=c*2+1, sticky="w", padx=(2, 10), pady=3)
+            btn = tk.Button(cell, text=val, width=9, relief="groove", font=("Consolas", 9, "bold"))
+            btn.grid(row=0, column=1, sticky="w")
             self.color_buttons[key] = btn
             
             def update_btn():
                 hex_val = color_var.get()
-                btn.config(bg=hex_val, fg="#000000" if is_light_color(hex_val) else "#FFFFFF")
+                btn.config(text=hex_val, bg=hex_val, fg="#000000" if is_light_color(hex_val) else "#FFFFFF")
                 
             def choose_color():
                 _, hex_val = colorchooser.askcolor(color_var.get(), parent=self, title=f"{label_text} 색상 선택")
@@ -295,58 +288,49 @@ class App(EditorTools, tk.Tk):
             ("급식 제목", "meals_title", 2, 1),
             ("식사 구분", "meals_type", 3, 0),
             ("급식 메뉴", "meals_dish", 3, 1),
-            ("요일", "date_weekday", 4, 0),
-            ("날짜", "date_calendar", 4, 1),
-            ("D-Day", "dday_label", 5, 0),
-            ("일정 이름", "dday_name", 5, 1),
+            ("요일 텍스트", "date_weekday", 4, 0),
+            ("날짜 텍스트", "date_calendar", 4, 1),
+            ("D-Day 라벨", "dday_label", 5, 0),
+            ("학사일정 이름", "dday_name", 5, 1),
         ]
         
         for label, key, r, col in color_items:
             val = colors_cfg.get(key, DEFAULT_COLORS.get(key, "#FFFFFF"))
             make_color_btn(color_frame, label, key, val, r, col)
 
+        self._build_color_tools(color_content)
+
         # ----------------------------------------------------
         # Tab 3: 배치 및 효과 설정
         # ----------------------------------------------------
-        layout_frame = ttk.Frame(tab_design)
-        layout_frame.pack(fill="both", expand=True, padx=6, pady=12)
+        layout_frame = ttk.LabelFrame(tab_design, text=" 섹션 배치 및 개별 효과 설정 ")
+        layout_frame.pack(fill="both", expand=True, padx=15, pady=6)
 
         # 일괄 동일 적용 체크박스
         self.sync_effects = tk.BooleanVar(value=True)
-        ttk.Checkbutton(layout_frame, text="효과 함께 바꾸기",
+        ttk.Checkbutton(layout_frame, text="테두리·그림자 함께 적용",
                         variable=self.sync_effects).pack(anchor="w", padx=10, pady=4)
 
-        selector_row = ttk.Frame(layout_frame)
-        selector_row.pack(fill='x', padx=10, pady=(12, 16))
-        ttk.Label(selector_row, text='항목').pack(side='left', padx=(0, 12))
-        self.section_choice = ttk.Combobox(selector_row, state='readonly', width=12,
-                                           values=['학교', '시간표', '급식', '날짜', '일정'])
-        self.section_choice.pack(side='left')
-        self.section_choice.current(0)
-        section_stack = ttk.Frame(layout_frame)
-        section_stack.pack(fill='both', expand=True, padx=8)
-        section_stack.rowconfigure(0, weight=1)
-        section_stack.columnconfigure(0, weight=1)
-        self.section_frames = []
-        self.section_choice.bind('<<ComboboxSelected>>', lambda event: self.section_frames[self.section_choice.current()].tkraise())
+        # 섹션별 하위 탭 Notebook
+        sub_notebook = self.section_tabs = ttk.Notebook(layout_frame)
+        sub_notebook.pack(fill="both", expand=True, padx=8, pady=4)
 
         sections_cfg = self.cfg.get("sections", DEFAULT_SECTIONS)
         self.sec_vars = {}
         self.label_vars = {}
+        self.section_tool_buttons = {}
 
         sections_info = [
-            ("학교", "school_info"),
+            ("학교 정보", "school_info"),
             ("시간표", "timetable"),
             ("급식", "meals"),
-            ("날짜", "date_info"),
-            ("일정", "dday")
+            ("날짜 정보", "date_info"),
+            ("학사일정 D-Day", "dday")
         ]
 
         for kr_name, sec_key in sections_info:
-            tab_container, sec_frame = self.make_scrollable_tab(section_stack)
-            tab_container.grid(row=0, column=0, sticky='nsew')
-            self.section_frames.append(tab_container)
-            sec_frame.columnconfigure(1, weight=1)
+            tab_container, sec_frame = self.make_scrollable_tab(sub_notebook)
+            sub_notebook.add(tab_container, text=f" {kr_name} ")
 
             sec_cfg = sections_cfg.get(sec_key, DEFAULT_SECTIONS[sec_key])
             
@@ -368,10 +352,10 @@ class App(EditorTools, tk.Tk):
                 self.label_vars[sec_key][k] = tk.StringVar(value=str(sec_cfg.get(k, DEFAULT_SECTIONS[sec_key][k])))
 
             # 0. 표시 여부
-            ttk.Checkbutton(sec_frame, text="표시", variable=vars_dict["show"]).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=12)
+            ttk.Checkbutton(sec_frame, text="바탕화면에 이 섹션 표시", variable=vars_dict["show"]).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=3)
 
             # 1. 가로 위치 X (%)
-            ttk.Label(sec_frame, text="가로 위치").grid(row=1, column=0, sticky="w", padx=10, pady=8)
+            ttk.Label(sec_frame, text="가로 위치 X (%)").grid(row=1, column=0, sticky="w", padx=10, pady=2)
             x_scale = ttk.Scale(sec_frame, from_=0, to=100, variable=vars_dict["x"], orient="horizontal", length=220)
             x_scale.grid(row=1, column=1, padx=10, pady=2)
             x_scale.config(command=self.make_slider_callback(sec_key, "x", vars_dict["x"]))
@@ -379,7 +363,7 @@ class App(EditorTools, tk.Tk):
             ttk.Label(sec_frame, textvariable=self.label_vars[sec_key]["x"]).grid(row=1, column=2, padx=5, sticky="w")
 
             # 2. 세로 위치 Y (%)
-            ttk.Label(sec_frame, text="세로 위치").grid(row=2, column=0, sticky="w", padx=10, pady=8)
+            ttk.Label(sec_frame, text="세로 위치 Y (%)").grid(row=2, column=0, sticky="w", padx=10, pady=2)
             y_scale = ttk.Scale(sec_frame, from_=0, to=100, variable=vars_dict["y"], orient="horizontal", length=220)
             y_scale.grid(row=2, column=1, padx=10, pady=2)
             y_scale.config(command=self.make_slider_callback(sec_key, "y", vars_dict["y"]))
@@ -387,7 +371,7 @@ class App(EditorTools, tk.Tk):
             ttk.Label(sec_frame, textvariable=self.label_vars[sec_key]["y"]).grid(row=2, column=2, padx=5, sticky="w")
 
             # 3. 글자 크기 (%) 슬라이더
-            ttk.Label(sec_frame, text="글자 크기").grid(row=3, column=0, sticky="w", padx=10, pady=8)
+            ttk.Label(sec_frame, text="글자 크기 (%)").grid(row=3, column=0, sticky="w", padx=10, pady=2)
             fs_scale = ttk.Scale(sec_frame, from_=50, to=200, variable=vars_dict["font_size"], orient="horizontal", length=220)
             fs_scale.grid(row=3, column=1, padx=10, pady=2)
             fs_scale.config(command=self.make_slider_callback(sec_key, "font_size", vars_dict["font_size"]))
@@ -395,7 +379,7 @@ class App(EditorTools, tk.Tk):
             ttk.Label(sec_frame, textvariable=self.label_vars[sec_key]["font_size"]).grid(row=3, column=2, padx=5, sticky="w")
 
             # 4. 테두리 두께 슬라이더
-            ttk.Label(sec_frame, text="테두리").grid(row=4, column=0, sticky="w", padx=10, pady=8)
+            ttk.Label(sec_frame, text="테두리 두께 (px)").grid(row=4, column=0, sticky="w", padx=10, pady=2)
             stroke_slider = ttk.Scale(sec_frame, from_=0, to=5, variable=vars_dict["stroke_width"], orient="horizontal", length=220)
             stroke_slider.grid(row=4, column=1, padx=10, pady=2)
             stroke_slider.config(command=self.make_slider_callback(sec_key, "stroke_width", vars_dict["stroke_width"]))
@@ -403,7 +387,7 @@ class App(EditorTools, tk.Tk):
             ttk.Label(sec_frame, textvariable=self.label_vars[sec_key]["stroke_width"]).grid(row=4, column=2, padx=5, sticky="w")
 
             # 5. 그림자 블러 슬라이더
-            ttk.Label(sec_frame, text="그림자 흐림").grid(row=5, column=0, sticky="w", padx=10, pady=8)
+            ttk.Label(sec_frame, text="그림자 흐림").grid(row=5, column=0, sticky="w", padx=10, pady=2)
             blur_slider = ttk.Scale(sec_frame, from_=0, to=10, variable=vars_dict["shadow_blur"], orient="horizontal", length=220)
             blur_slider.grid(row=5, column=1, padx=10, pady=2)
             blur_slider.config(command=self.make_slider_callback(sec_key, "shadow_blur", vars_dict["shadow_blur"]))
@@ -411,7 +395,7 @@ class App(EditorTools, tk.Tk):
             ttk.Label(sec_frame, textvariable=self.label_vars[sec_key]["shadow_blur"]).grid(row=5, column=2, padx=5, sticky="w")
 
             # 6. 그림자 투명도 슬라이더
-            ttk.Label(sec_frame, text="그림자 진하기").grid(row=6, column=0, sticky="w", padx=10, pady=8)
+            ttk.Label(sec_frame, text="그림자 진하기").grid(row=6, column=0, sticky="w", padx=10, pady=2)
             op_slider = ttk.Scale(sec_frame, from_=0, to=255, variable=vars_dict["shadow_opacity"], orient="horizontal", length=220)
             op_slider.grid(row=6, column=1, padx=10, pady=2)
             op_slider.config(command=self.make_slider_callback(sec_key, "shadow_opacity", vars_dict["shadow_opacity"]))
@@ -420,7 +404,7 @@ class App(EditorTools, tk.Tk):
 
             # 7. 학사일정만 표시 개수 지정 가능 (최대 10개, 기본 3개)
             if sec_key == "dday":
-                ttk.Label(sec_frame, text="표시 개수").grid(row=7, column=0, sticky="w", padx=10, pady=8)
+                ttk.Label(sec_frame, text="표시 개수 (최대 10)").grid(row=7, column=0, sticky="w", padx=10, pady=2)
                 self.dday_count_var = tk.IntVar(value=self.cfg.get("dday_count", 3))
                 count_spin = ttk.Spinbox(sec_frame, from_=1, to=10, textvariable=self.dday_count_var, width=5,
                                           command=self.trigger_live_apply)
@@ -429,47 +413,54 @@ class App(EditorTools, tk.Tk):
                 # 8. 수동 학사일정 (NEIS에 없는 시험 등을 직접 추가) — 있으면 자동 조회분과
                 #    합쳐서 날짜순으로 표시된다. 개별 색상 지정 가능(기본은 노란색과 동일)
                 ttk.Separator(sec_frame, orient="horizontal").grid(row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=6)
-                ttk.Label(sec_frame, text="내 일정").grid(row=9, column=0, columnspan=3, sticky="w", padx=10)
+                ttk.Label(sec_frame, text="직접 추가한 일정",
+                          font=("맑은 고딕", 10, "bold")).grid(row=9, column=0, columnspan=3, sticky="w", padx=10)
 
                 self.manual_dday = [dict(m) for m in (self.cfg.get("manual_dday") or [])]
-                self.manual_list = tk.Listbox(sec_frame, height=4, width=24, font=("맑은 고딕", 12))
-                self.manual_list.grid(row=10, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
+                self.manual_list = tk.Listbox(sec_frame, height=4, width=48, font=("맑은 고딕", 10))
+                self.manual_list.grid(row=10, column=0, columnspan=3, sticky="w", padx=10, pady=3)
                 self._refresh_manual_dday_list()
 
                 add_row = ttk.Frame(sec_frame)
                 add_row.grid(row=11, column=0, columnspan=3, sticky="w", padx=10, pady=2)
                 ttk.Label(add_row, text="이름").pack(side="left")
                 self.manual_name_var = tk.StringVar()
-                ttk.Entry(add_row, textvariable=self.manual_name_var, width=10).pack(side="left", padx=(4, 10))
-                ttk.Label(add_row, text="날짜").pack(side="left")
+                ttk.Entry(add_row, textvariable=self.manual_name_var, width=12).pack(side="left", padx=(4, 10))
+                ttk.Label(add_row, text="날짜(YYYY-MM-DD)").pack(side="left")
                 self.manual_date_var = tk.StringVar()
-                ttk.Entry(add_row, textvariable=self.manual_date_var, width=10).pack(side="left", padx=(4, 10))
+                ttk.Entry(add_row, textvariable=self.manual_date_var, width=12).pack(side="left", padx=(4, 10))
 
                 self.manual_color_var = tk.StringVar(value="")  # 비어있으면 기본 노란색
-                self.manual_color_btn = tk.Button(sec_frame, text="기본색", width=9, command=self.on_pick_manual_color)
-                self.manual_color_btn.grid(row=12, column=2, padx=8, pady=8)
+                self.manual_color_btn = tk.Button(add_row, text="기본색", width=7, command=self.on_pick_manual_color)
+                self.manual_color_btn.pack(side="left", padx=(0, 10))
                 self._default_button_bg = self.manual_color_btn.cget("bg")
 
                 btn_row2 = ttk.Frame(sec_frame)
-                btn_row2.grid(row=12, column=0, columnspan=2, sticky="w", padx=10, pady=8)
+                btn_row2.grid(row=12, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
                 ttk.Button(btn_row2, text="추가", command=self.on_add_manual_dday).pack(side="left", padx=(0, 6))
                 ttk.Button(btn_row2, text="선택 삭제", command=self.on_remove_manual_dday).pack(side="left")
 
-        self.section_frames[0].tkraise()
+            self._build_section_tools(sec_frame, sec_key, 13 if sec_key == 'dday' else 7)
 
         # ----------------------------------------------------
         # 공통 하단 영역
         # ----------------------------------------------------
         self.status_var = tk.StringVar(value="")
-        self.apply_btn = ttk.Button(self.footer, text="적용", command=self.on_apply, width=8)
-        self.apply_btn.pack(side="right", padx=(10, 0))
-        self.cancel_btn = ttk.Button(self.footer, text="변경 취소", command=self.on_cancel)
-        self.cancel_btn.pack(side="right", padx=(10, 0))
-        ttk.Label(self.footer, textvariable=self.dirty_var, foreground='#956000').pack(side='right', padx=12)
-        self.status_label = ttk.Label(self.footer, textvariable=self.status_var, foreground='#456452', width=1)
+        status_row = ttk.Frame(self)
+        status_row.pack(fill='x', padx=15, pady=(2, 0))
+        ttk.Label(status_row, textvariable=self.dirty_var, foreground='#956000').pack(side='right', padx=(10, 0))
+        self.status_label = ttk.Label(status_row, textvariable=self.status_var, foreground='#1a7a1a', width=1)
         self.status_label.pack(side='left', fill='x', expand=True)
-        self.status_label.configure(cursor='hand2')
-        self.status_label.bind('<Button-1>', lambda event: self._text_dialog('상태', self.status_var.get()) if self.status_var.get() else None)
+        self.status_label.bind('<Configure>', lambda event: self.status_label.configure(wraplength=max(100, event.width)))
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(pady=10)
+        self.apply_btn = ttk.Button(btn_row, text="저장 및 지금 적용", command=self.on_apply)
+        self.apply_btn.pack(side="left", padx=6)
+        self.cancel_btn = ttk.Button(btn_row, text="변경 취소", command=self.on_cancel)
+        self.cancel_btn.pack(side="left", padx=6)
+        ttk.Button(btn_row, text="디자인 기본값", command=self.on_reset).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="닫기", command=self.destroy).pack(side="left", padx=6)
 
         # 실시간 바탕화면 연동 (Live Apply) 바인딩 시작
         self.bind_variables_for_live_apply()
@@ -516,7 +507,61 @@ class App(EditorTools, tk.Tk):
             self.themes = builtins(main.merge_defaults({}))
             self.status_var.set(f"테마 파일을 읽지 못했습니다: {error}")
         self.theme_combo.configure(values=[item['name'] for item in self.themes])
-        self.theme_combo.set(selected or "현재 디자인")
+        self.theme_combo.set(selected or "테마를 선택하세요")
+
+    def _build_color_tools(self, parent):
+        self.color_palettes = color_palettes(DEFAULT_COLORS)
+        palettes = self._tool_group(parent, '색상 조합')
+        self.palette_buttons = {}
+        for index, palette in enumerate(self.color_palettes):
+            row = self._tool_cell(palettes, index // 2, index % 2)
+            button = ttk.Button(row, text=palette['name'],
+                                command=lambda item=palette: self.on_color_palette(item))
+            button.grid(row=0, column=0, sticky='w')
+            self.palette_buttons[palette['id']] = button
+            swatches = ttk.Frame(row)
+            swatches.grid(row=0, column=1, sticky='w')
+            for key in ('school_name', 'school_name_muted', 'timetable_title', 'meals_title', 'dday_label'):
+                tk.Frame(swatches, width=19, height=14, background=palette['colors'][key],
+                         borderwidth=1, relief='solid').pack(side='left', padx=1)
+
+        grouped = self._tool_group(parent, '한 번에 변경')
+        self.group_color_buttons = {}
+        for index, (group, label) in enumerate((('all', '전체 글자…'), ('body', '본문…'),
+                                               ('accent', '제목·강조…'))):
+            row = self._tool_cell(grouped, index // 2, index % 2)
+            button = ttk.Button(row, text=label,
+                                command=lambda key=group: self.on_group_color(key))
+            button.grid(row=0, column=0, sticky='w')
+            self.group_color_buttons[group] = button
+        row = self._tool_cell(grouped, 1, 1)
+        self.reset_colors_btn = ttk.Button(row, text='색상 초기화',
+                                           command=lambda: self._change_colors(DEFAULT_COLORS, '색상 초기화'))
+        self.reset_colors_btn.grid(row=0, column=0, sticky='w')
+
+    def _change_colors(self, colors, label):
+        if self._applying:
+            return
+        validate_style({'font_colors': colors})
+        def edit():
+            for key, color in colors.items():
+                self.colors_vars[key].set(color)
+                self.update_color_button_visuals(key)
+        self._edit_draft(edit, label)
+
+    def on_color_palette(self, palette):
+        self._change_colors(palette['colors'], f"{palette['name']} 색상")
+
+    def on_group_color(self, group):
+        if self._applying:
+            return
+        keys = COLOR_GROUPS[group]
+        labels = {'all': '전체 글자', 'body': '본문', 'accent': '제목·강조'}
+        first = next(key for key in self.colors_vars if key in keys)
+        _, color = colorchooser.askcolor(self.colors_vars[first].get(), parent=self,
+                                         title=f'{labels[group]} 색상 선택')
+        if color:
+            self._change_colors(dict.fromkeys(keys, color), f'{labels[group]} 색상 변경')
 
     def on_theme_selected(self, event=None):
         if self._applying:
@@ -527,7 +572,7 @@ class App(EditorTools, tk.Tk):
                 draft = apply_style(self._collect_draft(), self.themes[index]['style'])
                 self._remember()
                 self._load_widgets(draft)
-                self.status_var.set("테마 선택됨")
+                self.status_var.set("테마 미리보기 · 적용 전")
             except (ValueError, tk.TclError) as error:
                 messagebox.showerror("테마 선택 실패", str(error), parent=self)
 
@@ -540,7 +585,7 @@ class App(EditorTools, tk.Tk):
         try:
             item = self.theme_store.save(name, self._collect_draft())
             self._refresh_themes(item['name'])
-            self.status_var.set("테마 저장됨")
+            self.status_var.set("디자인 저장 완료")
         except (ValueError, OSError, tk.TclError) as error:
             messagebox.showerror("테마 저장 실패", str(error), parent=self)
 
@@ -551,11 +596,10 @@ class App(EditorTools, tk.Tk):
             self.selected_school = None
             self.search_results = []
             self.result_list.delete(0, 'end')
-            self.result_list.pack_forget()
             self.day_var.set(cfg.get('display_day', 'today'))
             self.manual_timetable = deepcopy(cfg.get('manual_timetable', []))
             self._manual_identity = identity(cfg)
-            self.selected_school_var.set(f"선택: {cfg.get('school_name') or '없음'}")
+            self.selected_school_var.set(f"현재 선택된 학교: {cfg.get('school_name') or '없음'}")
             for key, variable in (("school_name", self.school_name_var), ("grade", self.grade_var), ("classnm", self.class_var)):
                 variable.set(cfg.get(key, ""))
             self.photo_mode.set(cfg.get('bg_photo_mode', 'auto'))
@@ -587,7 +631,7 @@ class App(EditorTools, tk.Tk):
         self._load_widgets(deepcopy(self.cfg))
         self.selected_school_var.set(self._selected_school_label())
         self.theme_combo.set("마지막 적용 상태")
-        self.status_var.set("변경 취소됨")
+        self.status_var.set("변경 취소 완료")
 
     def make_scrollable_tab(self, parent):
         """섹션 탭 안에 위젯이 많아져도(예: 수동 학사일정 목록) 창 높이를 넘어가면
@@ -753,12 +797,19 @@ class App(EditorTools, tk.Tk):
             render_cfg = deepcopy(self.cfg) if self.compare_var.get() else deepcopy(cfg)
             cache = self._preview_cache(render_cfg)
             day = target_day(render_cfg, main.datetime.now()).strftime('%Y%m%d')
-            self.preview_note.configure(text=(
-                "예시"
-                if not render_cfg.get('school_code') else
-                ('저장본 · ' if self.compare_var.get() else '') +
-                ('내일' if render_cfg.get('display_day') == 'tomorrow' else '오늘') +
-                (' · 조회 전' if cache.get('date') != day else '')))
+            if not render_cfg.get('school_code'):
+                note = '학교 미설정 · 예시 데이터'
+            else:
+                states = cache.get('states', {})
+                states = states if isinstance(states, dict) else {}
+                state_labels = {'fresh': '조회', 'cached': '저장', 'empty': '없음', 'unavailable': '실패'}
+                status = ' · '.join(f'{label} {state_labels.get(states.get(key), "미확인")}'
+                                    for key, label in (('timetable', '시간표'), ('meals', '급식'), ('schedule', '일정')))
+                if cache.get('date') != day:
+                    status = '저장 데이터 없음 · F5 새로고침'
+                note = ('저장본' if self.compare_var.get() else '편집본') + ' · ' + (
+                    '내일' if render_cfg.get('display_day') == 'tomorrow' else '오늘') + '\n' + status
+            self.preview_note.configure(text=note)
             render_cfg['_preview_revision'] = self._preview_revision
             self._preview_worker.submit(render_cfg)
         except (ValueError, tk.TclError) as error:
@@ -810,7 +861,7 @@ class App(EditorTools, tk.Tk):
                         self._session_cache = None
                         self._load_widgets(current_draft)
                         warning = b.get('autostart_error') or b.get('warning') or ' / '.join(b.get('warnings', []))
-                        self.status_var.set(f"배경 적용 완료 · {warning}" if warning else "적용 완료")
+                        self.status_var.set(f"배경 적용 완료 · {warning}" if warning else "배경 적용 완료")
                         self.trigger_live_apply()
                 elif kind == 'refreshed':
                     self._refreshing = False
@@ -821,12 +872,12 @@ class App(EditorTools, tk.Tk):
                         self.status_var.set(f'새로고침 실패: {error}')
                     elif a == current_key:
                         self._session_cache = (a, deepcopy(b))
-                        self.status_var.set('새로고침 완료')
+                        self.status_var.set('데이터 새로고침 완료')
                         self.trigger_live_apply()
                     else:
-                        self.status_var.set('선택 변경됨 · 다시 조회하세요')
+                        self.status_var.set('선택 변경됨 · 다시 새로고침하세요')
                 elif kind == 'exported':
-                    self.status_var.set(f'이미지 내보내기 실패: {error}' if error else '이미지 저장 완료')
+                    self.status_var.set(f'이미지 내보내기 실패: {error}' if error else f'이미지를 저장했습니다: {a}')
                 elif kind == 'searched':
                     self._searching = False
                     self.search_btn.configure(state='normal')
@@ -837,10 +888,8 @@ class App(EditorTools, tk.Tk):
                         continue
                     self.search_results = b
                     self.selected_school = None
-                    self.selected_school_var.set('검색 결과에서 선택')
+                    self.selected_school_var.set('검색 결과에서 학교를 선택해주세요')
                     self.result_list.delete(0, tk.END)
-                    self.result_list.configure(height=min(5, max(1, len(b))))
-                    self.result_list.pack(before=self.school_class_row, fill='x', padx=15, pady=10)
                     for school in b:
                         self.result_list.insert(tk.END, f"{school['SCHUL_NM']}  [{school['SCHUL_KND_SC_NM']}]  {school.get('ORG_RDNMA', '')}")
                     if not b:
@@ -869,8 +918,6 @@ class App(EditorTools, tk.Tk):
                 draw.line((0, y, image.width, y), fill='#7eabb3', width=1)
         width, height = max(100, self.preview_label.winfo_width()), max(100, self.preview_label.winfo_height())
         zoom = self.zoom_var.get()
-        for bar in (self.preview_scroll_x, self.preview_scroll_y):
-            bar.grid_remove() if zoom == '화면에 맞춤' else bar.grid()
         if zoom == '화면에 맞춤':
             image.thumbnail((width, height), Image.Resampling.LANCZOS)
         elif zoom == '150%':
@@ -894,7 +941,7 @@ class App(EditorTools, tk.Tk):
                     return brightness > 128
                 return True
                 
-            btn.config(text='', bg=hex_val, fg="#000000" if is_light_color(hex_val) else "#FFFFFF")
+            btn.config(text=hex_val, bg=hex_val, fg="#000000" if is_light_color(hex_val) else "#FFFFFF")
 
     def on_reset(self):
         # 1. 색상 기본값으로 되돌리기
@@ -916,25 +963,21 @@ class App(EditorTools, tk.Tk):
 
         self.dday_count_var.set(3)
 
-        self.status_var.set("디자인 초기화됨")
+        self.status_var.set("기본 설정으로 초기화되었습니다 ✓")
         # 즉시 바탕화면에 변경 사항 반영
         self.trigger_live_apply()
 
     def update_bg_ui_state(self):
         mode = self.photo_mode.get()
-        self.preset_row.pack_forget()
-        self.photo_row.pack_forget()
         if mode == "auto":
             self.preset_combo.config(state="disabled")
             self.photo_entry.config(state="disabled")
             self.photo_browse_btn.config(state="disabled")
         elif mode == "preset":
-            self.preset_row.pack(before=self.custom_radio, fill='x', padx=30, pady=(6, 12))
             self.preset_combo.config(state="readonly")
             self.photo_entry.config(state="disabled")
             self.photo_browse_btn.config(state="disabled")
         elif mode == "custom":
-            self.photo_row.pack(fill='x', padx=30, pady=8)
             self.preset_combo.config(state="disabled")
             self.photo_entry.config(state="readonly")
             self.photo_browse_btn.config(state="normal")
@@ -942,11 +985,11 @@ class App(EditorTools, tk.Tk):
     def _selected_school_label(self):
         cur = self.selected_school if hasattr(self, "selected_school") else None
         if cur:
-            return f"선택: {cur['SCHUL_NM']} ({cur['SCHUL_KND_SC_NM']})"
+            return f"현재 선택된 학교: {cur['SCHUL_NM']} ({cur['SCHUL_KND_SC_NM']})"
         cfg_name = self.cfg.get("school_name") if hasattr(self, "cfg") else ""
         if cfg_name:
-            return f"선택: {cfg_name}"
-        return "학교를 선택하세요"
+            return f"현재 선택된 학교: {cfg_name} (저장된 설정)"
+        return "선택된 학교 없음 — 검색 후 목록에서 클릭해주세요"
 
     def on_result_select(self, event=None):
         # 검색 결과를 클릭하는 즉시 선택을 확정한다 (Apply 시점까지 미루면
@@ -955,10 +998,7 @@ class App(EditorTools, tk.Tk):
         selection = self.result_list.curselection()
         if selection and self.search_results and selection[0] < len(self.search_results):
             self.selected_school = self.search_results[selection[0]]
-            self.school_name_var.set(self.selected_school['SCHUL_NM'])
             self.selected_school_var.set(self._selected_school_label())
-            self.result_list.pack_forget()
-            self.status_var.set('학교 선택됨')
             self.trigger_live_apply()
 
     def on_search(self):
@@ -971,7 +1011,7 @@ class App(EditorTools, tk.Tk):
         self._searching = True
         self.selected_school = None
         self.search_btn.configure(state='disabled')
-        self.status_var.set('학교 검색 중…')
+        self.status_var.set('학교를 검색하고 있습니다…')
         def search():
             try:
                 self._ui_events.put(('searched', name, search_school(name), None))
@@ -997,7 +1037,7 @@ class App(EditorTools, tk.Tk):
             if not cfg.get('school_code') or not cfg.get('grade') or not cfg.get('classnm'):
                 raise ValueError("학교를 검색·선택하고 학년과 반을 입력해주세요.")
             if not self.selected_school and cfg['school_name'] != self._draft_base.get('school_name'):
-                raise ValueError("학교 이름을 바꿨다면 검색 결과에서 선택.")
+                raise ValueError("학교 이름을 바꿨다면 검색 결과에서 학교를 선택해주세요.")
             # Validate display values without including private school data in themes.
             cfg = apply_style(cfg, extract_style(cfg))
             if identity(cfg) != self._manual_identity:
@@ -1017,7 +1057,7 @@ class App(EditorTools, tk.Tk):
         for button in (self.apply_btn, self.cancel_btn, self.save_theme_btn):
             button.configure(state='disabled')
         self.theme_combo.configure(state='disabled')
-        self.status_var.set("적용 중…")
+        self.status_var.set("디자인을 저장하고 바탕화면에 적용하고 있습니다…")
         threading.Thread(target=self._run_engine, args=(deepcopy(cfg),), daemon=True).start()
 
     def _run_engine(self, cfg):
